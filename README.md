@@ -1,8 +1,16 @@
 # claude-telegram-bridge
 
-Drive [Claude Code](https://docs.claude.com/en/docs/claude-code) on your
-machine from a Telegram chat. Each chat is its own continuous Claude
-session. Read-only tools auto-allow; anything that mutates state (`Bash`,
+Drive an AI coding agent on your machine from a Telegram chat. Supports
+two backends:
+
+- **claude** — [Claude Code](https://docs.claude.com/en/docs/claude-code)
+  via `claude-agent-sdk` (the default).
+- **opencode** — [opencode](https://opencode.ai) via its local HTTP
+  server (`opencode serve`). Experimental.
+
+Each chat can hold multiple sessions, each with its own backend, working
+directory, and conversation history. Read-only tools auto-allow (claude
+backend) or follow opencode's permission config; anything else (`Bash`,
 `Write`, `Edit`, ...) sends an inline **Allow / Deny** prompt to your chat.
 
 The bridge runs **on your computer**. Telegram is just the front-end. Your
@@ -38,7 +46,7 @@ Optional but recommended:
   start - show active session info
   sessions - list all sessions in this chat
   switch - switch active session by id
-  new - create a new session and switch to it
+  new - create a new session (optional backend arg)
   rm - remove a session by id
   stop - interrupt the current task
   cd - change working directory
@@ -71,17 +79,29 @@ If you don't have `uv`, install it from
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
-pip install "claude-agent-sdk>=0.1.72" "python-telegram-bot>=21.0"
+pip install "claude-agent-sdk>=0.1.72" "python-telegram-bot>=21.0" "httpx>=0.27" "httpx-sse>=0.4"
 ```
 
-You also need the **Claude CLI** installed and authenticated on the same
-machine — `claude-agent-sdk` shells out to it. See the
-[Claude Agent SDK docs](https://docs.claude.com/en/api/agent-sdk/overview)
-for installation. A quick sanity check:
+### Backend prerequisites
+
+For the **claude** backend (default), you need the **Claude CLI** installed
+and authenticated on the same machine — `claude-agent-sdk` shells out to
+it. See the [Claude Agent SDK docs](https://docs.claude.com/en/api/agent-sdk/overview)
+for installation. Quick sanity check: `claude --version`.
+
+For the **opencode** backend you need a running `opencode serve` on the
+same machine (or any reachable host). The bridge does **not** spawn it for
+you. Quick start:
 
 ```bash
-claude --version
+# install: https://opencode.ai/docs/install
+export OPENCODE_SERVER_PASSWORD="$(openssl rand -hex 16)"
+opencode serve --port 4096 --hostname 127.0.0.1
 ```
+
+Leave that running in another terminal. The bridge will pick up the same
+`OPENCODE_SERVER_PASSWORD` from its env. If you skip the password the
+server is unauthenticated — fine for `127.0.0.1` only, never expose it.
 
 ## 4. Configure environment variables
 
@@ -92,12 +112,28 @@ Required:
 | `TELEGRAM_BOT_TOKEN`  | The token from BotFather                               |
 | `ALLOWED_USER_IDS`    | Your numeric Telegram user ID (comma-separated for >1) |
 
-Optional:
+Optional (general):
 
-| Variable              | Default           | What it is                              |
-| --------------------- | ----------------- | --------------------------------------- |
-| `CLAUDE_BRIDGE_CWD`   | `$HOME`           | Default working directory for sessions  |
-| `CLAUDE_BRIDGE_MODEL` | `claude-opus-4-7` | Claude model to use                     |
+| Variable             | Default  | What it is                                       |
+| -------------------- | -------- | ------------------------------------------------ |
+| `CLAUDE_BRIDGE_CWD`  | `$HOME`  | Default working directory for new sessions       |
+| `BRIDGE_BACKEND`     | `claude` | Default backend: `claude` or `opencode`          |
+
+Optional (claude backend):
+
+| Variable              | Default           | What it is                  |
+| --------------------- | ----------------- | --------------------------- |
+| `CLAUDE_BRIDGE_MODEL` | `claude-opus-4-7` | Claude model to use         |
+
+Optional (opencode backend):
+
+| Variable                    | Default                  | What it is                                                                |
+| --------------------------- | ------------------------ | ------------------------------------------------------------------------- |
+| `OPENCODE_BASE_URL`         | `http://127.0.0.1:4096`  | URL where `opencode serve` is listening                                   |
+| `OPENCODE_SERVER_USERNAME`  | `opencode`               | HTTP Basic auth username (only used if password is set)                   |
+| `OPENCODE_SERVER_PASSWORD`  | _(unset)_                | HTTP Basic auth password — must match what `opencode serve` was given     |
+| `OPENCODE_BRIDGE_MODEL`     | _(unset)_                | Model in `<provider>/<id>` form, e.g. `anthropic/claude-sonnet-4-5`       |
+| `OPENCODE_BRIDGE_AGENT`     | _(unset)_                | Default opencode agent (e.g. `build`)                                     |
 
 Export them in your shell:
 
@@ -106,6 +142,11 @@ export TELEGRAM_BOT_TOKEN="123456789:ABCdef..."
 export ALLOWED_USER_IDS="12345678"
 export CLAUDE_BRIDGE_CWD="$HOME/workspace/some-repo"
 export CLAUDE_BRIDGE_MODEL="claude-opus-4-7"
+
+# only if you want opencode:
+export BRIDGE_BACKEND="opencode"
+export OPENCODE_SERVER_PASSWORD="..."
+export OPENCODE_BRIDGE_MODEL="anthropic/claude-sonnet-4-5"
 ```
 
 Or drop them in a `.env` file and `source` it before running. Keep that
@@ -138,7 +179,7 @@ bridge starting (cwd=..., model=..., allowed=[12345678])
 | `/start`        | Show active session (cwd / model / id)                                  |
 | `/sessions`     | List all sessions in this chat (alias: `/ls`). Active is marked `▶`     |
 | `/switch <id>`  | Switch the active session to the given short id (e.g. `/switch 2`)      |
-| `/new`          | Create a new session and make it active. Old sessions stick around      |
+| `/new [backend]`| Create a new session and make it active. Backend is `claude` or `opencode`; defaults to `BRIDGE_BACKEND`. Old sessions stick around |
 | `/rm <id>`      | Remove a session and disconnect its client                              |
 | `/stop`         | Interrupt the running task                                              |
 | `/cd <path>`    | Change cwd of the active session (takes effect on next message)         |
@@ -146,18 +187,22 @@ bridge starting (cwd=..., model=..., allowed=[12345678])
 
 ### Multiple sessions
 
-Each chat can hold multiple Claude sessions, each with its own conversation
-history, working directory, and model. Sessions get short numeric IDs (`1`,
-`2`, `3`, ...) so switching is just `/switch 2`.
+Each chat can hold multiple sessions, each with its own backend,
+conversation history, working directory, and model. Sessions get short
+numeric IDs (`1`, `2`, `3`, ...) so switching is just `/switch 2`. You
+can mix backends in one chat:
 
 ```
 You:  /sessions
 Bot:  Sessions
-      ▶ #1  /Users/me/repo-a   claude-opus-4-7  [open]
-        #2  /Users/me/repo-b   claude-opus-4-7
+      ▶ #1  claude    /Users/me/repo-a   claude-opus-4-7  [open]
+        #2  opencode  /Users/me/repo-b   anthropic/claude-sonnet-4-5
 
-You:  /switch 2
-Bot:  Switched to session #2.
+You:  /new opencode
+Bot:  🆕 New session #3 (backend=opencode, active).
+
+You:  /switch 1
+Bot:  Switched to session #1 (claude).
 ```
 
 Only one task runs at a time per chat — `/stop` it before switching while
@@ -165,13 +210,31 @@ something is in flight.
 
 ### Tool permissions
 
-- Read-only tools (`Read`, `Glob`, `Grep`, `WebFetch`, `WebSearch`,
-  `TodoWrite`, `NotebookRead`) **auto-allow**.
-- Anything else (`Bash`, `Write`, `Edit`, etc.) sends an inline
-  **Allow / Deny** prompt to your chat. Approval times out after 10
-  minutes and defaults to deny.
+**claude backend.** Read-only tools (`Read`, `Glob`, `Grep`, `WebFetch`,
+`WebSearch`, `TodoWrite`, `NotebookRead`) **auto-allow**. Anything else
+(`Bash`, `Write`, `Edit`, ...) sends an inline **Allow / Deny** prompt.
+To change which tools auto-allow, edit `AUTO_ALLOW_TOOLS` in
+`backends/claude.py`.
 
-To change which tools auto-allow, edit `AUTO_ALLOW_TOOLS` in `bridge.py`.
+**opencode backend.** Permission policy lives in opencode itself
+(typically `~/.config/opencode/opencode.json` or repo-local
+`opencode.json`). Whatever opencode marks as `"ask"` triggers a Telegram
+prompt. Example:
+
+```json
+{
+  "permission": {
+    "read": "allow",
+    "list": "allow",
+    "grep": "allow",
+    "bash": "ask",
+    "write": "ask",
+    "edit": "ask"
+  }
+}
+```
+
+Approval times out after 10 minutes on either backend and defaults to deny.
 
 ## 7. Keep it running (optional)
 
@@ -193,6 +256,10 @@ The bridge is a foreground Python process. A few options to keep it up:
   `bridge.py` is running. Telegram long-polling kicks the older one off.
 - **`claude: command not found` in logs** — install and authenticate the
   Claude CLI on the host running the bridge.
+- **opencode `failed to start session: ConnectError`** — `opencode serve`
+  isn't running, or `OPENCODE_BASE_URL` doesn't match its `--port`.
+- **opencode `401 Unauthorized`** — `OPENCODE_SERVER_PASSWORD` mismatch
+  between the bridge and the server, or set on one but not the other.
 - **Approval buttons do nothing** — the message must come from a
   whitelisted user. Callback queries from anyone else are rejected.
 

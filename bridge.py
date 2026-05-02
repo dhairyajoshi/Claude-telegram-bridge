@@ -1,10 +1,11 @@
 """
-Claude Code <-> Telegram bridge.
+Coding-agent <-> Telegram bridge.
 
-Lets you drive Claude Code on this Mac from a Telegram chat. Each chat can
-hold multiple Claude sessions (short numeric IDs) and you switch between
-them with /switch. Read-only tools auto-allow; Bash/Write/Edit prompt with
-Allow/Deny buttons.
+Lets you drive an AI coding agent (Claude Code or opencode) on this Mac
+from a Telegram chat. Each chat can hold multiple sessions (short numeric
+IDs) and you switch between them with /switch. Read-only tools auto-allow
+(Claude backend) or use opencode's own permission config; everything else
+prompts with Allow/Deny buttons.
 
 Setup
 -----
@@ -14,14 +15,22 @@ Setup
        export TELEGRAM_BOT_TOKEN=...
        export ALLOWED_USER_IDS=12345              # comma-separated
        export CLAUDE_BRIDGE_CWD=$HOME/some/repo   # optional, default $HOME
-       export CLAUDE_BRIDGE_MODEL=claude-opus-4-7 # optional
+
+   Backend selection (default: claude):
+       export BRIDGE_BACKEND=claude               # or "opencode"
+       export CLAUDE_BRIDGE_MODEL=claude-opus-4-7 # claude backend default
+       # opencode backend (run `opencode serve` separately):
+       export OPENCODE_BASE_URL=http://127.0.0.1:4096
+       export OPENCODE_SERVER_PASSWORD=...        # if you set one
+       export OPENCODE_BRIDGE_MODEL=anthropic/claude-sonnet-4-5  # provider/model
+
 4. uv run python bridge.py
 
 Commands in chat:
     /start                show active session
     /sessions             list sessions in this chat
     /switch <id>          switch active session
-    /new                  create a new session and switch to it
+    /new [backend]        create a new session (backend: claude|opencode)
     /rm <id>              remove a session
     /stop                 interrupt the running task
     /cd <path>            change cwd of the active session
@@ -38,17 +47,6 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ClaudeSDKClient,
-    PermissionResultAllow,
-    PermissionResultDeny,
-    ResultMessage,
-    TextBlock,
-    ThinkingBlock,
-    ToolUseBlock,
-)
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -65,6 +63,15 @@ from telegram.ext import (
     filters,
 )
 
+from backends import (
+    Backend,
+    BackendSession,
+    ResultEvent,
+    TextEvent,
+    ToolUseEvent,
+    load_backend,
+)
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,49 +86,83 @@ ALLOWED_USER_IDS = {
     if x.strip()
 }
 DEFAULT_CWD = os.environ.get("CLAUDE_BRIDGE_CWD") or os.path.expanduser("~")
-DEFAULT_MODEL = os.environ.get("CLAUDE_BRIDGE_MODEL", "claude-opus-4-7")
+DEFAULT_BACKEND = os.environ.get("BRIDGE_BACKEND", "claude")
 
-AUTO_ALLOW_TOOLS = {
-    "Read", "Glob", "Grep", "WebFetch", "WebSearch",
-    "TodoWrite", "NotebookRead",
-}
+KNOWN_BACKENDS = ("claude", "opencode")
+
+# Resolved Backend instances, lazily populated. We keep them per-process
+# (they're just factories) so two chats can share one OpencodeBackend.
+_BACKENDS: dict[str, Backend] = {}
+
+
+def get_backend(name: str) -> Backend:
+    b = _BACKENDS.get(name)
+    if b is None:
+        b = load_backend(name)
+        _BACKENDS[name] = b
+    return b
+
 
 MAX_MSG_LEN = 3500
 APPROVAL_TIMEOUT_S = 600
 
 
+# ---- Per-chat / per-session state -----------------------------------------
+
 @dataclass
-class ClaudeSession:
+class BridgeSession:
+    """One conversation slot in a Telegram chat. Wraps a BackendSession plus
+    the user-visible metadata (cwd/model/backend) we render in /sessions."""
     sid: str
+    backend_name: str
     cwd: str
     model: str
-    client: Optional[ClaudeSDKClient] = None
+    backend_session: Optional[BackendSession] = None
+
+
+@dataclass
+class QueuedPrompt:
+    """A user message waiting its turn. ``session`` is captured at enqueue
+    time, so a message stays pinned to the session it was typed into even
+    if the active session changes (via ``/switch``) before the worker gets
+    to it."""
+    session: BridgeSession
+    text: str
 
 
 @dataclass
 class ChatState:
     chat_id: int
-    sessions: dict[str, ClaudeSession] = field(default_factory=dict)
+    sessions: dict[str, BridgeSession] = field(default_factory=dict)
     active_sid: Optional[str] = None
+    # ``current_task`` is the in-flight ``run_query`` for the head of the
+    # queue. ``worker_task`` is the long-lived drain loop that pulls items
+    # off ``queue`` and runs them serially.
     current_task: Optional[asyncio.Task] = None
     running_sid: Optional[str] = None
     pending_approvals: dict[str, asyncio.Future] = field(default_factory=dict)
+    queue: "asyncio.Queue[QueuedPrompt]" = field(default_factory=asyncio.Queue)
+    worker_task: Optional[asyncio.Task] = None
     _next_id: int = 1
 
-    def new_session(self, *, cwd: Optional[str] = None,
-                    model: Optional[str] = None) -> ClaudeSession:
+    def new_session(self, *, backend_name: Optional[str] = None,
+                    cwd: Optional[str] = None,
+                    model: Optional[str] = None) -> BridgeSession:
+        bname = backend_name or DEFAULT_BACKEND
+        backend = get_backend(bname)
         sid = str(self._next_id)
         self._next_id += 1
-        s = ClaudeSession(
+        s = BridgeSession(
             sid=sid,
+            backend_name=bname,
             cwd=cwd or DEFAULT_CWD,
-            model=model or DEFAULT_MODEL,
+            model=model or backend.default_model(),
         )
         self.sessions[sid] = s
         self.active_sid = sid
         return s
 
-    def active(self) -> Optional[ClaudeSession]:
+    def active(self) -> Optional[BridgeSession]:
         if self.active_sid is None:
             return None
         return self.sessions.get(self.active_sid)
@@ -138,7 +179,7 @@ def get_chat(chat_id: int) -> ChatState:
     return c
 
 
-def get_or_create_active(chat_id: int) -> tuple[ChatState, ClaudeSession]:
+def get_or_create_active(chat_id: int) -> tuple[ChatState, BridgeSession]:
     c = get_chat(chat_id)
     s = c.active()
     if s is None:
@@ -146,7 +187,7 @@ def get_or_create_active(chat_id: int) -> tuple[ChatState, ClaudeSession]:
     return c, s
 
 
-# ---------- auth ----------
+# ---- auth -----------------------------------------------------------------
 
 def is_authorized(update: Update) -> bool:
     user = update.effective_user
@@ -160,7 +201,7 @@ async def deny(update: Update) -> None:
                 update.effective_user.id if update.effective_user else None)
 
 
-# ---------- telegram send helpers ----------
+# ---- telegram send helpers ------------------------------------------------
 
 async def send_chunked(bot, chat_id: int, text: str, *,
                         parse_mode: Optional[str] = None) -> None:
@@ -178,40 +219,48 @@ async def send_chunked(bot, chat_id: int, text: str, *,
 
 
 def render_tool_call(name: str, inp: dict) -> str:
-    if name == "Bash":
+    """Pretty-print a tool call. Tool names from claude_agent_sdk are
+    PascalCase ("Bash", "Edit"); from opencode they're lowercase ("bash",
+    "edit"). We match case-insensitively and display whatever name we got."""
+    key = (name or "").lower()
+    if key == "bash":
         cmd = inp.get("command", "")
         desc = inp.get("description", "")
         body = f"<pre>{html.escape(cmd[:1500])}</pre>"
         if desc:
             body = f"<i>{html.escape(desc)}</i>\n{body}"
-        return f"🔧 <b>Bash</b>\n{body}"
-    if name in ("Write", "Edit"):
-        path = inp.get("file_path", "")
-        return f"✏️ <b>{name}</b> <code>{html.escape(path)}</code>"
-    if name == "Read":
-        return f"📖 <b>Read</b> <code>{html.escape(inp.get('file_path', ''))}</code>"
-    if name == "Glob":
-        return f"🔍 <b>Glob</b> <code>{html.escape(inp.get('pattern', ''))}</code>"
-    if name == "Grep":
-        return f"🔍 <b>Grep</b> <code>{html.escape(inp.get('pattern', ''))}</code>"
+        return f"🔧 <b>{html.escape(name or 'bash')}</b>\n{body}"
+    if key in ("write", "edit"):
+        path = inp.get("file_path") or inp.get("filePath") or inp.get("path") or ""
+        return f"✏️ <b>{html.escape(name)}</b> <code>{html.escape(path)}</code>"
+    if key == "read":
+        path = inp.get("file_path") or inp.get("filePath") or inp.get("path") or ""
+        return f"📖 <b>{html.escape(name)}</b> <code>{html.escape(path)}</code>"
+    if key == "glob":
+        return (
+            f"🔍 <b>{html.escape(name)}</b> "
+            f"<code>{html.escape(inp.get('pattern', ''))}</code>"
+        )
+    if key == "grep":
+        return (
+            f"🔍 <b>{html.escape(name)}</b> "
+            f"<code>{html.escape(inp.get('pattern', ''))}</code>"
+        )
     blob = json.dumps(inp, indent=2, default=str)[:1200]
-    return f"🔧 <b>{html.escape(name)}</b>\n<pre>{html.escape(blob)}</pre>"
+    return f"🔧 <b>{html.escape(name or 'tool')}</b>\n<pre>{html.escape(blob)}</pre>"
 
 
-# ---------- permission flow ----------
+# ---- permission prompt (used by both backends) ----------------------------
 
-def make_can_use_tool(chat: ChatState, bot):
-    async def can_use_tool(tool_name, input_data, context):
-        if tool_name in AUTO_ALLOW_TOOLS:
-            return PermissionResultAllow()
-
+def make_permission_asker(chat: ChatState, bot):
+    async def ask_permission(tool_name: str, input_data: dict) -> bool:
         approval_id = uuid.uuid4().hex[:8]
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         chat.pending_approvals[approval_id] = future
 
         prompt_text = (
             "⚠️ <b>Permission requested</b>\n\n"
-            + render_tool_call(tool_name, input_data)
+            + render_tool_call(tool_name, input_data or {})
         )
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Allow", callback_data=f"a:{approval_id}"),
@@ -226,7 +275,7 @@ def make_can_use_tool(chat: ChatState, bot):
         except Exception as e:
             chat.pending_approvals.pop(approval_id, None)
             log.exception("failed to send approval prompt")
-            return PermissionResultDeny(message=f"bridge error: {e}")
+            return False
 
         try:
             allowed = await asyncio.wait_for(future, timeout=APPROVAL_TIMEOUT_S)
@@ -239,7 +288,7 @@ def make_can_use_tool(chat: ChatState, bot):
                 )
             except BadRequest:
                 pass
-            return PermissionResultDeny(message="approval timed out")
+            return False
         finally:
             chat.pending_approvals.pop(approval_id, None)
 
@@ -254,49 +303,44 @@ def make_can_use_tool(chat: ChatState, bot):
         except BadRequest:
             pass
 
-        return PermissionResultAllow() if allowed else PermissionResultDeny(
-            message="user denied"
-        )
+        return allowed
 
-    return can_use_tool
+    return ask_permission
 
 
-# ---------- session lifecycle ----------
+# ---- session lifecycle ----------------------------------------------------
 
-async def ensure_client(chat: ChatState, session: ClaudeSession,
-                         bot) -> ClaudeSDKClient:
-    if session.client is not None:
-        return session.client
-    options = ClaudeAgentOptions(
-        model=session.model,
+async def ensure_backend(chat: ChatState, session: BridgeSession,
+                          bot) -> BackendSession:
+    if session.backend_session is not None:
+        return session.backend_session
+    backend = get_backend(session.backend_name)
+    session.backend_session = await backend.open_session(
         cwd=session.cwd,
-        permission_mode="default",
-        can_use_tool=make_can_use_tool(chat, bot),
+        model=session.model,
+        ask_permission=make_permission_asker(chat, bot),
     )
-    client = ClaudeSDKClient(options=options)
-    await client.connect()
-    session.client = client
-    return client
+    return session.backend_session
 
 
-async def close_client(session: ClaudeSession) -> None:
-    if session.client is None:
+async def close_backend(session: BridgeSession) -> None:
+    if session.backend_session is None:
         return
     try:
-        await session.client.disconnect()
+        await session.backend_session.disconnect()
     except Exception:
-        log.exception("disconnect failed")
-    session.client = None
+        log.exception("backend disconnect failed")
+    session.backend_session = None
 
 
-# ---------- driving a turn ----------
+# ---- driving a turn -------------------------------------------------------
 
-async def run_query(chat: ChatState, session: ClaudeSession, prompt: str,
+async def run_query(chat: ChatState, session: BridgeSession, prompt: str,
                      bot) -> None:
     try:
-        client = await ensure_client(chat, session, bot)
+        backend = await ensure_backend(chat, session, bot)
     except Exception as e:
-        log.exception("ensure_client failed")
+        log.exception("ensure_backend failed")
         await bot.send_message(
             chat_id=chat.chat_id,
             text=f"❌ Failed to start session: {e}",
@@ -305,27 +349,22 @@ async def run_query(chat: ChatState, session: ClaudeSession, prompt: str,
 
     try:
         await bot.send_chat_action(chat_id=chat.chat_id, action=ChatAction.TYPING)
-        await client.query(prompt)
-        async for message in client.receive_response():
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        if block.text.strip():
-                            await send_chunked(bot, chat.chat_id, block.text)
-                    elif isinstance(block, ToolUseBlock):
-                        await bot.send_message(
-                            chat_id=chat.chat_id,
-                            text=render_tool_call(block.name, block.input),
-                            parse_mode=ParseMode.HTML,
-                        )
-                    elif isinstance(block, ThinkingBlock):
-                        pass
-            elif isinstance(message, ResultMessage):
-                if message.is_error or message.subtype != "success":
-                    suffix = f"\n{message.result}" if message.result else ""
+        async for ev in backend.query(prompt):
+            if isinstance(ev, TextEvent):
+                if ev.text.strip():
+                    await send_chunked(bot, chat.chat_id, ev.text)
+            elif isinstance(ev, ToolUseEvent):
+                await bot.send_message(
+                    chat_id=chat.chat_id,
+                    text=render_tool_call(ev.name, ev.input),
+                    parse_mode=ParseMode.HTML,
+                )
+            elif isinstance(ev, ResultEvent):
+                if ev.error:
+                    suffix = f"\n{ev.message}" if ev.message else ""
                     await bot.send_message(
                         chat_id=chat.chat_id,
-                        text=f"⚠️ {message.subtype}{suffix}",
+                        text=f"⚠️ {suffix or 'error'}",
                     )
     except asyncio.CancelledError:
         await bot.send_message(chat_id=chat.chat_id, text="⏸ Stopped.")
@@ -335,18 +374,127 @@ async def run_query(chat: ChatState, session: ClaudeSession, prompt: str,
         await bot.send_message(chat_id=chat.chat_id, text=f"❌ Error: {e}")
 
 
-# ---------- telegram handlers ----------
+# ---- message queue / worker -----------------------------------------------
+
+async def chat_worker(chat: ChatState, bot) -> None:
+    """Long-lived loop: pull queued prompts and run them serially. One per
+    chat. Started lazily by ``ensure_worker`` on the first message.
+
+    Why a single worker per chat (vs. per session): we want one task in
+    flight at a time per chat — that matches the existing UX (and
+    Telegram's read-the-output cadence). Multiple sessions in one chat
+    therefore time-share the worker; their queue items just stay tagged
+    with their target session."""
+    while True:
+        item = await chat.queue.get()
+        try:
+            # If the session was /rm'd between enqueue and now, drop the
+            # message rather than crashing or running it against a
+            # half-detached object.
+            if item.session.sid not in chat.sessions:
+                try:
+                    await bot.send_message(
+                        chat_id=chat.chat_id,
+                        text=(
+                            f"⚠️ Dropped queued message for removed "
+                            f"session #{item.session.sid}."
+                        ),
+                    )
+                except Exception:
+                    log.exception("notify drop failed")
+                continue
+
+            chat.running_sid = item.session.sid
+            task = asyncio.create_task(
+                run_query(chat, item.session, item.text, bot),
+                name=f"run_query:{chat.chat_id}:{item.session.sid}",
+            )
+            chat.current_task = task
+            try:
+                await task
+            except asyncio.CancelledError:
+                # /stop cancels the inner task; we swallow here so the
+                # worker keeps living for the next item (which /stop will
+                # already have drained, but be defensive).
+                pass
+            except Exception:
+                log.exception("run_query crashed")
+            finally:
+                chat.current_task = None
+                chat.running_sid = None
+        except Exception:
+            log.exception("chat_worker iteration failed")
+        finally:
+            chat.queue.task_done()
+
+
+def ensure_worker(chat: ChatState, bot) -> None:
+    if chat.worker_task is None or chat.worker_task.done():
+        chat.worker_task = asyncio.create_task(
+            chat_worker(chat, bot),
+            name=f"chat-worker:{chat.chat_id}",
+        )
+
+
+def drain_queue(chat: ChatState, *,
+                 only_sid: Optional[str] = None) -> int:
+    """Pop everything off ``chat.queue`` (or just items for one session)
+    and return how many were dropped. Used by /stop and /rm."""
+    if only_sid is None:
+        cleared = 0
+        while True:
+            try:
+                chat.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            chat.queue.task_done()
+            cleared += 1
+        return cleared
+
+    # Selective drain: rebuild the queue without the targeted session's
+    # entries. asyncio.Queue has no native filter, so we shuffle through a
+    # temp list.
+    keep: list[QueuedPrompt] = []
+    dropped = 0
+    while True:
+        try:
+            item = chat.queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        chat.queue.task_done()
+        if item.session.sid == only_sid:
+            dropped += 1
+        else:
+            keep.append(item)
+    for item in keep:
+        chat.queue.put_nowait(item)
+    return dropped
+
+
+def queue_depth_by_session(chat: ChatState) -> dict[str, int]:
+    """Snapshot per-session queue depth without disturbing ordering. We
+    poke at ``_queue`` (a deque) directly — it's an implementation detail
+    of asyncio.Queue but stable across CPython versions and only used
+    here for read-only display."""
+    counts: dict[str, int] = {}
+    for item in list(chat.queue._queue):  # type: ignore[attr-defined]
+        counts[item.session.sid] = counts.get(item.session.sid, 0) + 1
+    return counts
+
+
+# ---- telegram handlers ----------------------------------------------------
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return await deny(update)
     _, s = get_or_create_active(update.effective_chat.id)
     await update.message.reply_text(
-        f"Connected to Claude Code (session #{s.sid}).\n"
+        f"Connected (session #{s.sid}, backend={s.backend_name}).\n"
         f"cwd: {s.cwd}\n"
-        f"model: {s.model}\n\n"
+        f"model: {s.model or '(backend default)'}\n\n"
         "Send a message to start.\n"
-        "Commands: /sessions /switch <id> /new /rm <id> /stop /cd <path> /status",
+        "Commands: /sessions /switch <id> /new [backend] /rm <id> "
+        "/stop /cd <path> /status",
     )
 
 
@@ -363,19 +511,24 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     running_sid = c.running_sid if (
         c.current_task and not c.current_task.done()
     ) else None
+    qdepth = queue_depth_by_session(c)
 
     lines = ["<b>Sessions</b>"]
     for sid, s in c.sessions.items():
         marker = "▶" if sid == c.active_sid else " "
         flags = []
-        if s.client is not None:
+        if s.backend_session is not None:
             flags.append("open")
         if sid == running_sid:
             flags.append("running")
+        if qdepth.get(sid):
+            flags.append(f"queued: {qdepth[sid]}")
         flag_str = f" [{', '.join(flags)}]" if flags else ""
+        model = s.model or "(default)"
         lines.append(
-            f"{marker} <b>#{sid}</b>  <code>{html.escape(s.cwd)}</code>  "
-            f"<i>{html.escape(s.model)}</i>{flag_str}"
+            f"{marker} <b>#{sid}</b>  <code>{html.escape(s.backend_name)}</code>  "
+            f"<code>{html.escape(s.cwd)}</code>  "
+            f"<i>{html.escape(model)}</i>{flag_str}"
         )
     lines.append("")
     lines.append("Switch with <code>/switch &lt;id&gt;</code>")
@@ -405,9 +558,9 @@ async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     c.active_sid = sid
     s = c.sessions[sid]
     await update.message.reply_text(
-        f"Switched to session #{sid}.\n"
+        f"Switched to session #{sid} ({s.backend_name}).\n"
         f"cwd: {s.cwd}\n"
-        f"model: {s.model}"
+        f"model: {s.model or '(default)'}"
     )
 
 
@@ -418,11 +571,26 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if c.current_task and not c.current_task.done():
         await update.message.reply_text("Stop the current task first (/stop).")
         return
-    s = c.new_session()
+    args = ctx.args or []
+    backend_name = None
+    if args:
+        cand = args[0].lower()
+        if cand not in KNOWN_BACKENDS:
+            await update.message.reply_text(
+                f"Unknown backend {cand!r}. Known: {', '.join(KNOWN_BACKENDS)}"
+            )
+            return
+        backend_name = cand
+    try:
+        s = c.new_session(backend_name=backend_name)
+    except Exception as e:
+        log.exception("new_session failed")
+        await update.message.reply_text(f"❌ Could not create session: {e}")
+        return
     await update.message.reply_text(
-        f"🆕 New session #{s.sid} (active).\n"
+        f"🆕 New session #{s.sid} (backend={s.backend_name}, active).\n"
         f"cwd: {s.cwd}\n"
-        f"model: {s.model}"
+        f"model: {s.model or '(default)'}"
     )
 
 
@@ -444,16 +612,18 @@ async def cmd_rm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     s = c.sessions.pop(sid)
-    await close_client(s)
+    await close_backend(s)
+    dropped = drain_queue(c, only_sid=sid)
     if c.active_sid == sid:
         c.active_sid = next(iter(c.sessions), None)
+    suffix = f" Dropped {dropped} queued message(s)." if dropped else ""
     if c.active_sid:
         await update.message.reply_text(
-            f"Removed #{sid}. Active is now #{c.active_sid}."
+            f"Removed #{sid}. Active is now #{c.active_sid}.{suffix}"
         )
     else:
         await update.message.reply_text(
-            f"Removed #{sid}. No sessions left."
+            f"Removed #{sid}. No sessions left.{suffix}"
         )
 
 
@@ -461,15 +631,32 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return await deny(update)
     c = CHATS.get(update.effective_chat.id)
-    if not c or not c.current_task or c.current_task.done():
+    is_running = bool(c and c.current_task and not c.current_task.done())
+    has_queue = bool(c and not c.queue.empty())
+
+    if not c or (not is_running and not has_queue):
         await update.message.reply_text("Nothing running.")
         return
-    running = c.sessions.get(c.running_sid) if c.running_sid else None
-    if running and running.client:
-        try:
-            await running.client.interrupt()
-        except Exception:
-            log.exception("interrupt failed")
+
+    # Drain the queue first so newly-popped items can't sneak past the
+    # interrupt below.
+    cleared = drain_queue(c)
+
+    if is_running:
+        running = c.sessions.get(c.running_sid) if c.running_sid else None
+        if running and running.backend_session:
+            try:
+                await running.backend_session.interrupt()
+            except Exception:
+                log.exception("interrupt failed")
+        # The backend's interrupt unwinds the running query naturally; we
+        # don't .cancel() the task because that races with the SDK's own
+        # teardown and can leave dangling state.
+
+    if cleared:
+        await update.message.reply_text(
+            f"🧹 Cleared {cleared} queued message(s)."
+        )
 
 
 async def cmd_cd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -487,7 +674,7 @@ async def cmd_cd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if c.current_task and not c.current_task.done() and c.running_sid == s.sid:
         await update.message.reply_text("Stop the current task first (/stop).")
         return
-    await close_client(s)
+    await close_backend(s)
     s.cwd = new_cwd
     await update.message.reply_text(
         f"#{s.sid} cwd → {new_cwd}\n(takes effect on next message)"
@@ -505,10 +692,12 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     running = bool(c.current_task and not c.current_task.done())
     await update.message.reply_text(
         f"active: #{s.sid if s else '-'}\n"
+        f"backend: {s.backend_name if s else '-'}\n"
         f"cwd: {s.cwd if s else '-'}\n"
-        f"model: {s.model if s else '-'}\n"
-        f"client: {'open' if (s and s.client) else 'idle'}\n"
+        f"model: {(s.model if s else '-') or '(default)'}\n"
+        f"client: {'open' if (s and s.backend_session) else 'idle'}\n"
         f"running: {running}{f' (#{c.running_sid})' if running else ''}\n"
+        f"queued: {c.queue.qsize()}\n"
         f"sessions: {len(c.sessions)}\n"
         f"pending approvals: {len(c.pending_approvals)}"
     )
@@ -520,14 +709,22 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not (update.message and update.message.text):
         return
     c, s = get_or_create_active(update.effective_chat.id)
-    if c.current_task and not c.current_task.done():
-        await update.message.reply_text("Already running. /stop to interrupt.")
-        return
-    c.running_sid = s.sid
-    c.current_task = asyncio.create_task(
-        run_query(c, s, update.message.text, ctx.bot),
-        name=f"run_query:{c.chat_id}:{s.sid}",
-    )
+
+    busy = c.current_task is not None and not c.current_task.done()
+    ensure_worker(c, ctx.bot)
+    await c.queue.put(QueuedPrompt(session=s, text=update.message.text))
+
+    # Only acknowledge if we're actually queueing behind something. If the
+    # worker is idle, the message will be picked up immediately and
+    # producing a "Queued" reply would just be noise on top of the agent's
+    # own output.
+    if busy:
+        # `qsize` after put = number of items still waiting. The currently
+        # running turn isn't in the queue (the worker already popped it).
+        position = c.queue.qsize()
+        await update.message.reply_text(
+            f"📥 Queued for #{s.sid} (position {position})."
+        )
 
 
 async def on_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -561,6 +758,10 @@ def main() -> None:
         raise SystemExit("Set ALLOWED_USER_IDS (comma-separated Telegram user ids)")
     if not os.path.isdir(DEFAULT_CWD):
         raise SystemExit(f"CLAUDE_BRIDGE_CWD does not exist: {DEFAULT_CWD}")
+    if DEFAULT_BACKEND not in KNOWN_BACKENDS:
+        raise SystemExit(
+            f"BRIDGE_BACKEND={DEFAULT_BACKEND!r} not in {KNOWN_BACKENDS}"
+        )
 
     app = (
         Application.builder()
@@ -587,8 +788,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_callback_query))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    log.info("bridge starting (cwd=%s, model=%s, allowed=%s)",
-             DEFAULT_CWD, DEFAULT_MODEL, sorted(ALLOWED_USER_IDS))
+    log.info("bridge starting (cwd=%s, backend=%s, allowed=%s)",
+             DEFAULT_CWD, DEFAULT_BACKEND, sorted(ALLOWED_USER_IDS))
     app.run_polling(allowed_updates=["message", "callback_query"])
 
 
