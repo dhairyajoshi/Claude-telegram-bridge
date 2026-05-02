@@ -35,11 +35,14 @@ Optional but recommended:
 - `/setcommands` → paste this so the slash menu shows up in chat:
 
   ```
-  start - show session info
-  new - start a fresh Claude session
+  start - show active session info
+  sessions - list all sessions in this chat
+  switch - switch active session by id
+  new - create a new session and switch to it
+  rm - remove a session by id
   stop - interrupt the current task
   cd - change working directory
-  status - show session status
+  status - show active session status
   ```
 
 ## 2. Find your Telegram user ID
@@ -130,13 +133,35 @@ bridge starting (cwd=..., model=..., allowed=[12345678])
 
 ### Commands
 
-| Command       | Effect                                                          |
-| ------------- | --------------------------------------------------------------- |
-| `/start`      | Show current cwd / model / session info                         |
-| `/new`        | Discard the current Claude session and start fresh              |
-| `/stop`       | Interrupt the running task                                      |
-| `/cd <path>`  | Change the working directory (takes effect on next message)     |
-| `/status`     | Show whether a task is running and any pending approvals        |
+| Command         | Effect                                                                  |
+| --------------- | ----------------------------------------------------------------------- |
+| `/start`        | Show active session (cwd / model / id)                                  |
+| `/sessions`     | List all sessions in this chat (alias: `/ls`). Active is marked `▶`     |
+| `/switch <id>`  | Switch the active session to the given short id (e.g. `/switch 2`)      |
+| `/new`          | Create a new session and make it active. Old sessions stick around      |
+| `/rm <id>`      | Remove a session and disconnect its client                              |
+| `/stop`         | Interrupt the running task                                              |
+| `/cd <path>`    | Change cwd of the active session (takes effect on next message)         |
+| `/status`       | Show running state and pending approvals for the active session         |
+
+### Multiple sessions
+
+Each chat can hold multiple Claude sessions, each with its own conversation
+history, working directory, and model. Sessions get short numeric IDs (`1`,
+`2`, `3`, ...) so switching is just `/switch 2`.
+
+```
+You:  /sessions
+Bot:  Sessions
+      ▶ #1  /Users/me/repo-a   claude-opus-4-7  [open]
+        #2  /Users/me/repo-b   claude-opus-4-7
+
+You:  /switch 2
+Bot:  Switched to session #2.
+```
+
+Only one task runs at a time per chat — `/stop` it before switching while
+something is in flight.
 
 ### Tool permissions
 

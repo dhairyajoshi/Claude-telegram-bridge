@@ -1,9 +1,10 @@
 """
 Claude Code <-> Telegram bridge.
 
-Lets you drive Claude Code on this Mac from a Telegram chat. Each chat is its
-own continuous Claude session. Read-only tools auto-allow; Bash/Write/Edit
-prompt with Allow/Deny buttons.
+Lets you drive Claude Code on this Mac from a Telegram chat. Each chat can
+hold multiple Claude sessions (short numeric IDs) and you switch between
+them with /switch. Read-only tools auto-allow; Bash/Write/Edit prompt with
+Allow/Deny buttons.
 
 Setup
 -----
@@ -16,7 +17,15 @@ Setup
        export CLAUDE_BRIDGE_MODEL=claude-opus-4-7 # optional
 4. uv run python bridge.py
 
-Commands in chat: /start /new /stop /cd <path> /status
+Commands in chat:
+    /start                show active session
+    /sessions             list sessions in this chat
+    /switch <id>          switch active session
+    /new                  create a new session and switch to it
+    /rm <id>              remove a session
+    /stop                 interrupt the running task
+    /cd <path>            change cwd of the active session
+    /status               status of active session
 """
 from __future__ import annotations
 
@@ -82,16 +91,59 @@ APPROVAL_TIMEOUT_S = 600
 
 
 @dataclass
-class ChatSession:
-    chat_id: int
+class ClaudeSession:
+    sid: str
     cwd: str
     model: str
     client: Optional[ClaudeSDKClient] = None
+
+
+@dataclass
+class ChatState:
+    chat_id: int
+    sessions: dict[str, ClaudeSession] = field(default_factory=dict)
+    active_sid: Optional[str] = None
     current_task: Optional[asyncio.Task] = None
+    running_sid: Optional[str] = None
     pending_approvals: dict[str, asyncio.Future] = field(default_factory=dict)
+    _next_id: int = 1
+
+    def new_session(self, *, cwd: Optional[str] = None,
+                    model: Optional[str] = None) -> ClaudeSession:
+        sid = str(self._next_id)
+        self._next_id += 1
+        s = ClaudeSession(
+            sid=sid,
+            cwd=cwd or DEFAULT_CWD,
+            model=model or DEFAULT_MODEL,
+        )
+        self.sessions[sid] = s
+        self.active_sid = sid
+        return s
+
+    def active(self) -> Optional[ClaudeSession]:
+        if self.active_sid is None:
+            return None
+        return self.sessions.get(self.active_sid)
 
 
-SESSIONS: dict[int, ChatSession] = {}
+CHATS: dict[int, ChatState] = {}
+
+
+def get_chat(chat_id: int) -> ChatState:
+    c = CHATS.get(chat_id)
+    if c is None:
+        c = ChatState(chat_id=chat_id)
+        CHATS[chat_id] = c
+    return c
+
+
+def get_or_create_active(chat_id: int) -> tuple[ChatState, ClaudeSession]:
+    c = get_chat(chat_id)
+    s = c.active()
+    if s is None:
+        s = c.new_session()
+    return c, s
 
 
 # ---------- auth ----------
@@ -148,14 +200,14 @@ def render_tool_call(name: str, inp: dict) -> str:
 
 # ---------- permission flow ----------
 
-def make_can_use_tool(session: ChatSession, bot):
+def make_can_use_tool(chat: ChatState, bot):
     async def can_use_tool(tool_name, input_data, context):
         if tool_name in AUTO_ALLOW_TOOLS:
             return PermissionResultAllow()
 
         approval_id = uuid.uuid4().hex[:8]
         future: asyncio.Future = asyncio.get_running_loop().create_future()
-        session.pending_approvals[approval_id] = future
+        chat.pending_approvals[approval_id] = future
 
         prompt_text = (
             "⚠️ <b>Permission requested</b>\n\n"
@@ -168,11 +220,11 @@ def make_can_use_tool(session: ChatSession, bot):
 
         try:
             msg = await bot.send_message(
-                chat_id=session.chat_id, text=prompt_text,
+                chat_id=chat.chat_id, text=prompt_text,
                 parse_mode=ParseMode.HTML, reply_markup=keyboard,
             )
         except Exception as e:
-            session.pending_approvals.pop(approval_id, None)
+            chat.pending_approvals.pop(approval_id, None)
             log.exception("failed to send approval prompt")
             return PermissionResultDeny(message=f"bridge error: {e}")
 
@@ -181,7 +233,7 @@ def make_can_use_tool(session: ChatSession, bot):
         except asyncio.TimeoutError:
             try:
                 await bot.edit_message_text(
-                    chat_id=session.chat_id, message_id=msg.message_id,
+                    chat_id=chat.chat_id, message_id=msg.message_id,
                     text=prompt_text + "\n\n<i>⌛ Timed out — denied</i>",
                     parse_mode=ParseMode.HTML,
                 )
@@ -189,11 +241,11 @@ def make_can_use_tool(session: ChatSession, bot):
                 pass
             return PermissionResultDeny(message="approval timed out")
         finally:
-            session.pending_approvals.pop(approval_id, None)
+            chat.pending_approvals.pop(approval_id, None)
 
         try:
             await bot.edit_message_text(
-                chat_id=session.chat_id, message_id=msg.message_id,
+                chat_id=chat.chat_id, message_id=msg.message_id,
                 text=prompt_text + (
                     "\n\n<i>✅ Allowed</i>" if allowed else "\n\n<i>❌ Denied</i>"
                 ),
@@ -211,22 +263,15 @@ def make_can_use_tool(session: ChatSession, bot):
 
 # ---------- session lifecycle ----------
 
-async def get_session(chat_id: int) -> ChatSession:
-    s = SESSIONS.get(chat_id)
-    if s is None:
-        s = ChatSession(chat_id=chat_id, cwd=DEFAULT_CWD, model=DEFAULT_MODEL)
-        SESSIONS[chat_id] = s
-    return s
-
-
-async def ensure_client(session: ChatSession, bot) -> ClaudeSDKClient:
+async def ensure_client(chat: ChatState, session: ClaudeSession,
+                         bot) -> ClaudeSDKClient:
     if session.client is not None:
         return session.client
     options = ClaudeAgentOptions(
         model=session.model,
         cwd=session.cwd,
         permission_mode="default",
-        can_use_tool=make_can_use_tool(session, bot),
+        can_use_tool=make_can_use_tool(chat, bot),
     )
     client = ClaudeSDKClient(options=options)
     await client.connect()
@@ -234,7 +279,7 @@ async def ensure_client(session: ChatSession, bot) -> ClaudeSDKClient:
     return client
 
 
-async def close_client(session: ChatSession) -> None:
+async def close_client(session: ClaudeSession) -> None:
     if session.client is None:
         return
     try:
@@ -246,29 +291,30 @@ async def close_client(session: ChatSession) -> None:
 
 # ---------- driving a turn ----------
 
-async def run_query(session: ChatSession, prompt: str, bot) -> None:
+async def run_query(chat: ChatState, session: ClaudeSession, prompt: str,
+                     bot) -> None:
     try:
-        client = await ensure_client(session, bot)
+        client = await ensure_client(chat, session, bot)
     except Exception as e:
         log.exception("ensure_client failed")
         await bot.send_message(
-            chat_id=session.chat_id,
+            chat_id=chat.chat_id,
             text=f"❌ Failed to start session: {e}",
         )
         return
 
     try:
-        await bot.send_chat_action(chat_id=session.chat_id, action=ChatAction.TYPING)
+        await bot.send_chat_action(chat_id=chat.chat_id, action=ChatAction.TYPING)
         await client.query(prompt)
         async for message in client.receive_response():
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock):
                         if block.text.strip():
-                            await send_chunked(bot, session.chat_id, block.text)
+                            await send_chunked(bot, chat.chat_id, block.text)
                     elif isinstance(block, ToolUseBlock):
                         await bot.send_message(
-                            chat_id=session.chat_id,
+                            chat_id=chat.chat_id,
                             text=render_tool_call(block.name, block.input),
                             parse_mode=ParseMode.HTML,
                         )
@@ -278,15 +324,15 @@ async def run_query(session: ChatSession, prompt: str, bot) -> None:
                 if message.is_error or message.subtype != "success":
                     suffix = f"\n{message.result}" if message.result else ""
                     await bot.send_message(
-                        chat_id=session.chat_id,
+                        chat_id=chat.chat_id,
                         text=f"⚠️ {message.subtype}{suffix}",
                     )
     except asyncio.CancelledError:
-        await bot.send_message(chat_id=session.chat_id, text="⏸ Stopped.")
+        await bot.send_message(chat_id=chat.chat_id, text="⏸ Stopped.")
         raise
     except Exception as e:
         log.exception("run_query failed")
-        await bot.send_message(chat_id=session.chat_id, text=f"❌ Error: {e}")
+        await bot.send_message(chat_id=chat.chat_id, text=f"❌ Error: {e}")
 
 
 # ---------- telegram handlers ----------
@@ -294,40 +340,134 @@ async def run_query(session: ChatSession, prompt: str, bot) -> None:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return await deny(update)
-    s = await get_session(update.effective_chat.id)
+    _, s = get_or_create_active(update.effective_chat.id)
     await update.message.reply_text(
-        "Connected to Claude Code.\n"
+        f"Connected to Claude Code (session #{s.sid}).\n"
         f"cwd: {s.cwd}\n"
         f"model: {s.model}\n\n"
-        "Send a message to start. Commands: /new /stop /cd <path> /status",
+        "Send a message to start.\n"
+        "Commands: /sessions /switch <id> /new /rm <id> /stop /cd <path> /status",
+    )
+
+
+async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        return await deny(update)
+    c = get_chat(update.effective_chat.id)
+    if not c.sessions:
+        await update.message.reply_text(
+            "No sessions yet. Send a message or /new to create one."
+        )
+        return
+
+    running_sid = c.running_sid if (
+        c.current_task and not c.current_task.done()
+    ) else None
+
+    lines = ["<b>Sessions</b>"]
+    for sid, s in c.sessions.items():
+        marker = "▶" if sid == c.active_sid else " "
+        flags = []
+        if s.client is not None:
+            flags.append("open")
+        if sid == running_sid:
+            flags.append("running")
+        flag_str = f" [{', '.join(flags)}]" if flags else ""
+        lines.append(
+            f"{marker} <b>#{sid}</b>  <code>{html.escape(s.cwd)}</code>  "
+            f"<i>{html.escape(s.model)}</i>{flag_str}"
+        )
+    lines.append("")
+    lines.append("Switch with <code>/switch &lt;id&gt;</code>")
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML
+    )
+
+
+async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        return await deny(update)
+    args = ctx.args or []
+    c = get_chat(update.effective_chat.id)
+    if not args:
+        await update.message.reply_text("Usage: /switch <id>")
+        return
+    sid = args[0].lstrip("#")
+    if sid not in c.sessions:
+        ids = ", ".join(f"#{x}" for x in c.sessions) or "(none)"
+        await update.message.reply_text(
+            f"No session #{sid}. Available: {ids}"
+        )
+        return
+    if c.current_task and not c.current_task.done():
+        await update.message.reply_text("Stop the current task first (/stop).")
+        return
+    c.active_sid = sid
+    s = c.sessions[sid]
+    await update.message.reply_text(
+        f"Switched to session #{sid}.\n"
+        f"cwd: {s.cwd}\n"
+        f"model: {s.model}"
     )
 
 
 async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return await deny(update)
-    s = await get_session(update.effective_chat.id)
-    if s.current_task and not s.current_task.done():
-        if s.client:
-            try:
-                await s.client.interrupt()
-            except Exception:
-                pass
-        s.current_task.cancel()
+    c = get_chat(update.effective_chat.id)
+    if c.current_task and not c.current_task.done():
+        await update.message.reply_text("Stop the current task first (/stop).")
+        return
+    s = c.new_session()
+    await update.message.reply_text(
+        f"🆕 New session #{s.sid} (active).\n"
+        f"cwd: {s.cwd}\n"
+        f"model: {s.model}"
+    )
+
+
+async def cmd_rm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        return await deny(update)
+    args = ctx.args or []
+    c = get_chat(update.effective_chat.id)
+    if not args:
+        await update.message.reply_text("Usage: /rm <id>")
+        return
+    sid = args[0].lstrip("#")
+    if sid not in c.sessions:
+        await update.message.reply_text(f"No session #{sid}.")
+        return
+    if c.current_task and not c.current_task.done() and c.running_sid == sid:
+        await update.message.reply_text(
+            f"Session #{sid} is running. /stop first."
+        )
+        return
+    s = c.sessions.pop(sid)
     await close_client(s)
-    await update.message.reply_text("🆕 Fresh session.")
+    if c.active_sid == sid:
+        c.active_sid = next(iter(c.sessions), None)
+    if c.active_sid:
+        await update.message.reply_text(
+            f"Removed #{sid}. Active is now #{c.active_sid}."
+        )
+    else:
+        await update.message.reply_text(
+            f"Removed #{sid}. No sessions left."
+        )
 
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return await deny(update)
-    s = SESSIONS.get(update.effective_chat.id)
-    if not s or not s.current_task or s.current_task.done():
+    c = CHATS.get(update.effective_chat.id)
+    if not c or not c.current_task or c.current_task.done():
         await update.message.reply_text("Nothing running.")
         return
-    if s.client:
+    running = c.sessions.get(c.running_sid) if c.running_sid else None
+    if running and running.client:
         try:
-            await s.client.interrupt()
+            await running.client.interrupt()
         except Exception:
             log.exception("interrupt failed")
 
@@ -336,36 +476,41 @@ async def cmd_cd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return await deny(update)
     args = ctx.args or []
-    s = await get_session(update.effective_chat.id)
+    c, s = get_or_create_active(update.effective_chat.id)
     if not args:
-        await update.message.reply_text(f"cwd: {s.cwd}")
+        await update.message.reply_text(f"#{s.sid} cwd: {s.cwd}")
         return
     new_cwd = os.path.expanduser(" ".join(args))
     if not os.path.isdir(new_cwd):
         await update.message.reply_text(f"Not a directory: {new_cwd}")
         return
-    if s.current_task and not s.current_task.done():
+    if c.current_task and not c.current_task.done() and c.running_sid == s.sid:
         await update.message.reply_text("Stop the current task first (/stop).")
         return
     await close_client(s)
     s.cwd = new_cwd
-    await update.message.reply_text(f"cwd → {new_cwd}\n(takes effect on next message)")
+    await update.message.reply_text(
+        f"#{s.sid} cwd → {new_cwd}\n(takes effect on next message)"
+    )
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return await deny(update)
-    s = SESSIONS.get(update.effective_chat.id)
-    if not s:
+    c = CHATS.get(update.effective_chat.id)
+    if not c or not c.sessions:
         await update.message.reply_text("No session.")
         return
-    running = bool(s.current_task and not s.current_task.done())
+    s = c.active()
+    running = bool(c.current_task and not c.current_task.done())
     await update.message.reply_text(
-        f"cwd: {s.cwd}\n"
-        f"model: {s.model}\n"
-        f"client: {'open' if s.client else 'idle'}\n"
-        f"running: {running}\n"
-        f"pending approvals: {len(s.pending_approvals)}"
+        f"active: #{s.sid if s else '-'}\n"
+        f"cwd: {s.cwd if s else '-'}\n"
+        f"model: {s.model if s else '-'}\n"
+        f"client: {'open' if (s and s.client) else 'idle'}\n"
+        f"running: {running}{f' (#{c.running_sid})' if running else ''}\n"
+        f"sessions: {len(c.sessions)}\n"
+        f"pending approvals: {len(c.pending_approvals)}"
     )
 
 
@@ -374,13 +519,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return await deny(update)
     if not (update.message and update.message.text):
         return
-    s = await get_session(update.effective_chat.id)
-    if s.current_task and not s.current_task.done():
+    c, s = get_or_create_active(update.effective_chat.id)
+    if c.current_task and not c.current_task.done():
         await update.message.reply_text("Already running. /stop to interrupt.")
         return
-    s.current_task = asyncio.create_task(
-        run_query(s, update.message.text, ctx.bot),
-        name=f"run_query:{s.chat_id}",
+    c.running_sid = s.sid
+    c.current_task = asyncio.create_task(
+        run_query(c, s, update.message.text, ctx.bot),
+        name=f"run_query:{c.chat_id}:{s.sid}",
     )
 
 
@@ -396,11 +542,11 @@ async def on_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         await cq.answer()
         return
     action, approval_id = data.split(":", 1)
-    s = SESSIONS.get(update.effective_chat.id)
-    if not s:
+    c = CHATS.get(update.effective_chat.id)
+    if not c:
         await cq.answer("No session.")
         return
-    fut = s.pending_approvals.get(approval_id)
+    fut = c.pending_approvals.get(approval_id)
     if fut is None or fut.done():
         await cq.answer("Already resolved.")
         return
@@ -430,7 +576,11 @@ def main() -> None:
         .build()
     )
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("sessions", cmd_sessions))
+    app.add_handler(CommandHandler("ls", cmd_sessions))
+    app.add_handler(CommandHandler("switch", cmd_switch))
     app.add_handler(CommandHandler("new", cmd_new))
+    app.add_handler(CommandHandler("rm", cmd_rm))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CommandHandler("status", cmd_status))
