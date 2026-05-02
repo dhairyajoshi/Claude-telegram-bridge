@@ -34,6 +34,7 @@ Commands in chat:
     /rm <id>              remove a session
     /stop                 interrupt the running task
     /cd <path>            change cwd of the active session
+    /resume [id|prefix]   adopt a Claude CLI session from disk
     /status               status of active session
 """
 from __future__ import annotations
@@ -73,6 +74,8 @@ from backends import (
     ToolUseEvent,
     load_backend,
 )
+import claude_sessions
+import state
 
 
 logging.basicConfig(
@@ -114,11 +117,17 @@ APPROVAL_TIMEOUT_S = 600
 @dataclass
 class BridgeSession:
     """One conversation slot in a Telegram chat. Wraps a BackendSession plus
-    the user-visible metadata (cwd/model/backend) we render in /sessions."""
+    the user-visible metadata (cwd/model/backend) we render in /sessions.
+
+    ``resume_id`` is the agent-level id (Claude session UUID, opencode
+    session id, ...) we persist so that a chat survives a bridge
+    restart. It's ``None`` until the backend assigns one — typically
+    after the first turn of a fresh session."""
     sid: str
     backend_name: str
     cwd: str
     model: str
+    resume_id: Optional[str] = None
     backend_session: Optional[BackendSession] = None
 
 
@@ -133,6 +142,16 @@ class QueuedPrompt:
 
 
 @dataclass
+class PendingResume:
+    """Adoption candidate displayed by ``/resume``. We capture the cwd
+    at list-time so a later button click can't be mis-routed if the
+    user changes the active session's cwd in between."""
+    cwd: str
+    backend_name: str
+    session_id: str
+
+
+@dataclass
 class ChatState:
     chat_id: int
     sessions: dict[str, BridgeSession] = field(default_factory=dict)
@@ -143,6 +162,7 @@ class ChatState:
     current_task: Optional[asyncio.Task] = None
     running_sid: Optional[str] = None
     pending_approvals: dict[str, asyncio.Future] = field(default_factory=dict)
+    pending_resumes: dict[str, PendingResume] = field(default_factory=dict)
     queue: "asyncio.Queue[QueuedPrompt]" = field(default_factory=asyncio.Queue)
     worker_task: Optional[asyncio.Task] = None
     _next_id: int = 1
@@ -186,6 +206,10 @@ def get_or_create_active(chat_id: int) -> tuple[ChatState, BridgeSession]:
     s = c.active()
     if s is None:
         s = c.new_session()
+        # Implicit creation (e.g. first /start or first message in a
+        # chat). Snapshot now so the session survives a restart even
+        # before its first turn populates ``resume_id``.
+        persist_state()
     return c, s
 
 
@@ -321,8 +345,111 @@ async def ensure_backend(chat: ChatState, session: BridgeSession,
         cwd=session.cwd,
         model=session.model,
         ask_permission=make_permission_asker(chat, bot),
+        resume_id=session.resume_id,
     )
     return session.backend_session
+
+
+# ---- persistence ----------------------------------------------------------
+
+def snapshot_state() -> dict:
+    """Serialize ``CHATS`` to the schema :mod:`state` writes to disk.
+
+    Live runtime fields (queue contents, in-flight tasks, pending
+    approvals, the BackendSession client) are intentionally dropped —
+    they're tied to the running process and don't survive a restart."""
+    return {
+        "chats": {
+            str(cid): {
+                "active_sid": c.active_sid,
+                "next_id": c._next_id,
+                "sessions": [
+                    {
+                        "sid": s.sid,
+                        "backend_name": s.backend_name,
+                        "cwd": s.cwd,
+                        "model": s.model,
+                        "resume_id": s.resume_id,
+                    }
+                    for s in c.sessions.values()
+                ],
+            }
+            for cid, c in CHATS.items()
+        },
+    }
+
+
+def persist_state() -> None:
+    """Snapshot + write. Best-effort — exceptions are swallowed so a
+    bad disk doesn't take down the bot."""
+    try:
+        state.save(snapshot_state())
+    except Exception:
+        log.exception("persist_state failed")
+
+
+def restore_state() -> None:
+    """Populate ``CHATS`` from ``state.load()``. Skips malformed
+    entries rather than failing the whole load — a corrupt session
+    record shouldn't lose every other chat."""
+    data = state.load()
+    chats = data.get("chats") or {}
+    if not isinstance(chats, dict):
+        return
+    for chat_id_s, chat_blob in chats.items():
+        if not isinstance(chat_blob, dict):
+            continue
+        try:
+            chat_id = int(chat_id_s)
+        except (TypeError, ValueError):
+            continue
+        c = ChatState(chat_id=chat_id)
+        for s_blob in chat_blob.get("sessions") or []:
+            if not isinstance(s_blob, dict):
+                continue
+            sid = s_blob.get("sid")
+            backend_name = s_blob.get("backend_name")
+            cwd = s_blob.get("cwd")
+            model = s_blob.get("model") or ""
+            if not (sid and backend_name and cwd):
+                continue
+            if backend_name not in KNOWN_BACKENDS:
+                log.warning(
+                    "skipping restored session #%s with unknown backend %r",
+                    sid, backend_name,
+                )
+                continue
+            c.sessions[str(sid)] = BridgeSession(
+                sid=str(sid),
+                backend_name=backend_name,
+                cwd=cwd,
+                model=model,
+                resume_id=s_blob.get("resume_id"),
+            )
+        active = chat_blob.get("active_sid")
+        if active and str(active) in c.sessions:
+            c.active_sid = str(active)
+        elif c.sessions:
+            c.active_sid = next(iter(c.sessions))
+        next_id = chat_blob.get("next_id")
+        if isinstance(next_id, int) and next_id > 0:
+            c._next_id = next_id
+        else:
+            # Recover a sane counter from the largest numeric sid we
+            # restored, so /new doesn't collide with an existing id.
+            existing = [
+                int(s) for s in c.sessions if str(s).isdigit()
+            ]
+            c._next_id = (max(existing) + 1) if existing else 1
+        if c.sessions:
+            CHATS[chat_id] = c
+    if CHATS:
+        log.info(
+            "restored %d chat(s), %d session(s) from %s",
+            len(CHATS),
+            sum(len(c.sessions) for c in CHATS.values()),
+            state.STATE_FILE,
+        )
 
 
 async def close_backend(session: BridgeSession) -> None:
@@ -485,8 +612,19 @@ async def run_query(chat: ChatState, session: BridgeSession, prompt: str,
     indicator = TurnIndicator(bot, chat.chat_id)
     await indicator.start()
 
+    # Snapshot after the (possibly newly-assigned) resume_id is set by
+    # the backend during the first event of the turn. We do it via a
+    # one-shot flag so we don't write to disk on every single event.
+    resume_synced = False
+
     try:
         async for ev in backend.query(prompt):
+            if not resume_synced:
+                new_resume = getattr(backend, "resume_id", None)
+                if new_resume and new_resume != session.resume_id:
+                    session.resume_id = new_resume
+                    persist_state()
+                    resume_synced = True
             if isinstance(ev, ThinkingEvent):
                 await indicator.thinking()
             elif isinstance(ev, TextEvent):
@@ -516,6 +654,13 @@ async def run_query(chat: ChatState, session: BridgeSession, prompt: str,
         await bot.send_message(chat_id=chat.chat_id, text=f"❌ Error: {e}")
     finally:
         await indicator.close()
+        # Final reconciliation: the backend may have refreshed resume_id
+        # later in the turn (e.g. SDK re-emits session_id in
+        # ResultMessage). Mid-turn we only wrote on the first change.
+        new_resume = getattr(backend, "resume_id", None)
+        if new_resume and new_resume != session.resume_id:
+            session.resume_id = new_resume
+            persist_state()
 
 
 # ---- message queue / worker -----------------------------------------------
@@ -701,6 +846,7 @@ async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     c.active_sid = sid
     s = c.sessions[sid]
+    persist_state()
     await update.message.reply_text(
         f"Switched to session #{sid} ({s.backend_name}).\n"
         f"cwd: {s.cwd}\n"
@@ -731,6 +877,7 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("new_session failed")
         await update.message.reply_text(f"❌ Could not create session: {e}")
         return
+    persist_state()
     await update.message.reply_text(
         f"🆕 New session #{s.sid} (backend={s.backend_name}, active).\n"
         f"cwd: {s.cwd}\n"
@@ -760,6 +907,7 @@ async def cmd_rm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     dropped = drain_queue(c, only_sid=sid)
     if c.active_sid == sid:
         c.active_sid = next(iter(c.sessions), None)
+    persist_state()
     suffix = f" Dropped {dropped} queued message(s)." if dropped else ""
     if c.active_sid:
         await update.message.reply_text(
@@ -820,8 +968,138 @@ async def cmd_cd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await close_backend(s)
     s.cwd = new_cwd
+    # The previous resume_id was tied to the old cwd's transcript file;
+    # carrying it forward would either fail to resume or, worse, splice
+    # an unrelated history into the new project. Drop it.
+    s.resume_id = None
+    persist_state()
     await update.message.reply_text(
         f"#{s.sid} cwd → {new_cwd}\n(takes effect on next message)"
+    )
+
+
+def _format_relative(seconds: float) -> str:
+    """Compact relative-time label for ``/resume`` listings. Picks the
+    coarsest unit that fits: ``45s``, ``12m``, ``3h``, ``2d``."""
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s ago"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
+
+
+def _adopt_session(c: ChatState, *, cwd: str, backend_name: str,
+                    session_id: str, model: Optional[str] = None) -> BridgeSession:
+    """Create a new bridge session pre-pointed at an existing agent
+    session. The backend won't actually open a client until the next
+    user message — at which point ``ensure_backend`` will pass
+    ``resume_id`` so the SDK rehydrates the prior transcript."""
+    backend = get_backend(backend_name)
+    sid = str(c._next_id)
+    c._next_id += 1
+    s = BridgeSession(
+        sid=sid,
+        backend_name=backend_name,
+        cwd=cwd,
+        model=model or backend.default_model(),
+        resume_id=session_id,
+    )
+    c.sessions[sid] = s
+    c.active_sid = sid
+    return s
+
+
+async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """List or adopt Claude CLI sessions stored on disk.
+
+    No args: render the most recent transcripts in the chat's active
+    cwd (or ``DEFAULT_CWD`` if no session yet) as Allow-style inline
+    buttons; clicking creates a new bridge session that resumes that
+    transcript.
+
+    With an id/prefix arg: skip the picker and adopt directly.
+    """
+    if not is_authorized(update):
+        return await deny(update)
+    c = get_chat(update.effective_chat.id)
+    s = c.active()
+    cwd = s.cwd if s else DEFAULT_CWD
+    args = ctx.args or []
+
+    if args:
+        query = args[0].strip()
+        info = claude_sessions.find_by_prefix(cwd, query)
+        if info is None:
+            await update.message.reply_text(
+                f"No matching session for {query!r} in {cwd}.\n"
+                f"Run /resume with no args to see the list."
+            )
+            return
+        new_s = _adopt_session(
+            c, cwd=cwd, backend_name="claude", session_id=info.session_id,
+        )
+        persist_state()
+        preview = (info.first_prompt or "(no preview)").replace("\n", " ")
+        if len(preview) > 80:
+            preview = preview[:77] + "..."
+        await update.message.reply_text(
+            f"📥 Adopted {info.session_id[:8]} as session #{new_s.sid}.\n"
+            f"<i>{html.escape(preview)}</i>\n"
+            f"Send a message to continue.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    sessions = claude_sessions.list_sessions(cwd, limit=8)
+    if not sessions:
+        await update.message.reply_text(
+            f"No Claude CLI sessions found for <code>{html.escape(cwd)}</code>.\n"
+            f"(Looked in: <code>{html.escape(claude_sessions.project_dir(cwd))}</code>)",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Stash candidates against short tokens so the callback can resolve
+    # them without us bloating callback_data past Telegram's 64-byte
+    # limit. Refreshing /resume replaces the prior list.
+    c.pending_resumes.clear()
+    now = time.time()
+    lines = [
+        f"<b>Claude CLI sessions</b> in <code>{html.escape(cwd)}</code>",
+        "",
+    ]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    for info in sessions:
+        token = uuid.uuid4().hex[:8]
+        c.pending_resumes[token] = PendingResume(
+            cwd=cwd, backend_name="claude", session_id=info.session_id,
+        )
+        preview = (info.first_prompt or "(empty)").replace("\n", " ")
+        if len(preview) > 60:
+            preview = preview[:57] + "..."
+        age = _format_relative(now - info.mtime)
+        lines.append(
+            f"• <code>{info.session_id[:8]}</code> · {age}\n"
+            f"   {html.escape(preview)}"
+        )
+        # Telegram button labels are clipped to ~64 chars in the UI.
+        # 8-char id + bullet + truncated preview keeps it readable.
+        btn_label = f"{info.session_id[:8]} · {preview[:30]}"
+        keyboard.append([
+            InlineKeyboardButton(btn_label, callback_data=f"r:{token}")
+        ])
+
+    lines.append("")
+    lines.append(
+        "Tap to adopt as a new bridge session. Old sessions are kept."
+    )
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -882,17 +1160,54 @@ async def on_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     if ":" not in data:
         await cq.answer()
         return
-    action, approval_id = data.split(":", 1)
+    action, payload = data.split(":", 1)
     c = CHATS.get(update.effective_chat.id)
     if not c:
         await cq.answer("No session.")
         return
-    fut = c.pending_approvals.get(approval_id)
-    if fut is None or fut.done():
-        await cq.answer("Already resolved.")
+
+    if action in ("a", "d"):
+        fut = c.pending_approvals.get(payload)
+        if fut is None or fut.done():
+            await cq.answer("Already resolved.")
+            return
+        fut.set_result(action == "a")
+        await cq.answer("Allowed." if action == "a" else "Denied.")
         return
-    fut.set_result(action == "a")
-    await cq.answer("Allowed." if action == "a" else "Denied.")
+
+    if action == "r":
+        opt = c.pending_resumes.pop(payload, None)
+        if opt is None:
+            await cq.answer("Already resolved or expired.")
+            return
+        try:
+            new_s = _adopt_session(
+                c, cwd=opt.cwd, backend_name=opt.backend_name,
+                session_id=opt.session_id,
+            )
+        except Exception as e:
+            log.exception("adopt failed")
+            await cq.answer(f"Adopt failed: {e}", show_alert=True)
+            return
+        persist_state()
+        await cq.answer(f"Adopted as #{new_s.sid}.")
+        # Strip the keyboard so the same row can't be tapped again
+        # (other rows in the same message are already orphaned —
+        # ``pending_resumes.clear()`` happens on the next /resume).
+        try:
+            await cq.edit_message_reply_markup(reply_markup=None)
+        except BadRequest:
+            pass
+        try:
+            await cq.message.reply_text(
+                f"📥 Adopted {opt.session_id[:8]} as session #{new_s.sid}.\n"
+                f"Send a message to continue."
+            )
+        except Exception:
+            log.exception("adopt notify failed")
+        return
+
+    await cq.answer()
 
 
 def main() -> None:
@@ -906,6 +1221,11 @@ def main() -> None:
         raise SystemExit(
             f"BRIDGE_BACKEND={DEFAULT_BACKEND!r} not in {KNOWN_BACKENDS}"
         )
+
+    # Rehydrate sessions from the previous run before we start polling,
+    # so an inbound message can resume immediately rather than racing
+    # the load.
+    restore_state()
 
     app = (
         Application.builder()
@@ -928,6 +1248,7 @@ def main() -> None:
     app.add_handler(CommandHandler("rm", cmd_rm))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("cd", cmd_cd))
+    app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CallbackQueryHandler(on_callback_query))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))

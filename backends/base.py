@@ -78,10 +78,17 @@ PermissionAsker = Callable[[str, dict], Awaitable[bool]]
 @runtime_checkable
 class BackendSession(Protocol):
     """One conversation with the agent. Holds cwd/model and the active
-    underlying client (SDK client, HTTP session id, etc.)."""
+    underlying client (SDK client, HTTP session id, etc.).
+
+    ``resume_id`` is the agent-level identifier the bridge persists so a
+    conversation can survive a bridge restart. It's set by the backend
+    once it knows the id (typically after the first turn), and read by
+    the bridge whenever it snapshots state to disk. ``None`` until the
+    backend has assigned one."""
 
     cwd: str
     model: str
+    resume_id: Optional[str]
 
     async def query(self, prompt: str):
         """Send ``prompt`` and asynchronously yield :data:`BackendEvent`\\ s
@@ -110,7 +117,14 @@ class Backend(Protocol):
         cwd: str,
         model: str,
         ask_permission: PermissionAsker,
+        resume_id: Optional[str] = None,
     ) -> BackendSession:
+        """Open a new live session. If ``resume_id`` is given, the
+        backend should attempt to continue that prior conversation
+        rather than starting fresh. Backends that can't resume (or whose
+        server has restarted since) should fall back to a new session
+        and overwrite ``resume_id`` on the returned session — the
+        bridge re-reads it after each turn."""
         ...
 
     def default_model(self) -> str:
