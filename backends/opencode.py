@@ -45,6 +45,7 @@ from .base import (
     PermissionAsker,
     ResultEvent,
     TextEvent,
+    ThinkingEvent,
     ToolUseEvent,
 )
 
@@ -72,9 +73,10 @@ class OpencodeBackendSession:
     _http: httpx.AsyncClient
     _agent: Optional[str] = None
     session_id: Optional[str] = None
-    # tool partIDs we've already announced this turn, so we don't spam the
-    # chat with the same tool call as it transitions pending -> completed.
-    _announced_tools: set = field(default_factory=set)
+    # part IDs we've already emitted an event for this turn (tool calls,
+    # reasoning bursts) so we don't spam the chat as parts transition
+    # through pending/running/completed snapshots.
+    _emitted_part_ids: set = field(default_factory=set)
     _pending_perm_tasks: set = field(default_factory=set)
 
     async def _ensure_session(self) -> str:
@@ -152,7 +154,7 @@ class OpencodeBackendSession:
                 yield TextEvent(text=text)
         elif ptype == "tool":
             part_id = part.get("id")
-            if part_id and part_id in self._announced_tools:
+            if part_id and part_id in self._emitted_part_ids:
                 return
             state = part.get("state") or {}
             status = state.get("status")
@@ -166,12 +168,21 @@ class OpencodeBackendSession:
             if inp is None:
                 inp = state.get("input") or {}
             if part_id:
-                self._announced_tools.add(part_id)
+                self._emitted_part_ids.add(part_id)
             yield ToolUseEvent(name=name, input=inp or {})
+        elif ptype == "reasoning":
+            # Reasoning parts get updated repeatedly as the model thinks;
+            # the bridge only needs the first ping to start its indicator.
+            part_id = part.get("id")
+            if part_id and part_id in self._emitted_part_ids:
+                return
+            if part_id:
+                self._emitted_part_ids.add(part_id)
+            yield ThinkingEvent()
 
     async def query(self, prompt: str):
-        # Fresh tool-dedup state per turn.
-        self._announced_tools = set()
+        # Fresh part-dedup state per turn (covers tools + reasoning bursts).
+        self._emitted_part_ids = set()
 
         try:
             await self._ensure_session()

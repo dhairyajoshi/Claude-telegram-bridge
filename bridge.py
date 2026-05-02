@@ -43,6 +43,7 @@ import html
 import json
 import logging
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
@@ -68,6 +69,7 @@ from backends import (
     BackendSession,
     ResultEvent,
     TextEvent,
+    ThinkingEvent,
     ToolUseEvent,
     load_backend,
 )
@@ -333,6 +335,139 @@ async def close_backend(session: BridgeSession) -> None:
     session.backend_session = None
 
 
+# ---- per-turn liveness indicator ------------------------------------------
+
+# Telegram displays a "typing" chat-action for ~5 seconds after each call,
+# so we refresh slightly under that to keep the indicator continuous.
+HEARTBEAT_INTERVAL_S = 4.0
+
+
+class TurnIndicator:
+    """Per-turn liveness signal. Two layers:
+
+    1. A repeating ``sendChatAction(TYPING)`` every ~4s so the chat header
+       always shows "typing…" while the agent is busy. This is the
+       cheapest, most idiomatic "still alive" hint Telegram offers.
+    2. A transient text message ("💭 thinking… (Ns)") spawned the first
+       time we see a :class:`ThinkingEvent` and updated by the heartbeat.
+       Finalised to "💭 thought for Ns" when the next non-thinking event
+       arrives, so the chat history shows that thinking happened without
+       the message lingering as a stale "thinking…" pill.
+
+    All Telegram calls are best-effort: any failure (rate limits, the
+    indicator message being deleted, network blips) is logged at debug
+    and the indicator continues. We never want this to take down a turn.
+    """
+
+    def __init__(self, bot, chat_id: int):
+        self.bot = bot
+        self.chat_id = chat_id
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._thinking_msg_id: Optional[int] = None
+        self._thinking_started_at: Optional[float] = None
+        self._last_thinking_text: str = ""
+
+    async def start(self) -> None:
+        # Kick off the indicator immediately so the user sees activity
+        # before the first model token.
+        try:
+            await self.bot.send_chat_action(
+                chat_id=self.chat_id, action=ChatAction.TYPING,
+            )
+        except Exception:
+            log.debug("initial chat_action failed", exc_info=True)
+        self._heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(), name=f"heartbeat:{self.chat_id}",
+        )
+
+    async def _heartbeat_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+                try:
+                    await self.bot.send_chat_action(
+                        chat_id=self.chat_id, action=ChatAction.TYPING,
+                    )
+                except Exception:
+                    log.debug("heartbeat chat_action failed", exc_info=True)
+                # If a thinking indicator is active, also tick its
+                # elapsed-time counter so it doesn't look frozen.
+                await self._refresh_thinking()
+        except asyncio.CancelledError:
+            return
+
+    async def _refresh_thinking(self) -> None:
+        if self._thinking_msg_id is None or self._thinking_started_at is None:
+            return
+        elapsed = int(time.time() - self._thinking_started_at)
+        text = f"💭 thinking… ({elapsed}s)"
+        if text == self._last_thinking_text:
+            return
+        try:
+            await self.bot.edit_message_text(
+                chat_id=self.chat_id,
+                message_id=self._thinking_msg_id,
+                text=text,
+            )
+            self._last_thinking_text = text
+        except BadRequest:
+            # "message is not modified" or "message to edit not found" —
+            # don't care, just stop trying to edit it.
+            pass
+        except Exception:
+            log.debug("thinking edit failed", exc_info=True)
+
+    async def thinking(self) -> None:
+        """Called when a ThinkingEvent arrives. Idempotent within a single
+        thinking burst — we only send the message once per burst."""
+        if self._thinking_msg_id is not None:
+            return
+        try:
+            msg = await self.bot.send_message(
+                chat_id=self.chat_id, text="💭 thinking…",
+            )
+        except Exception:
+            log.exception("send thinking message failed")
+            return
+        self._thinking_msg_id = msg.message_id
+        self._thinking_started_at = time.time()
+        self._last_thinking_text = "💭 thinking…"
+
+    async def end_thinking(self) -> None:
+        """Called when the first non-thinking event arrives, so the user
+        sees the thinking burst as a closed past tense rather than an
+        endlessly-spinning pill."""
+        if self._thinking_msg_id is None:
+            return
+        elapsed = max(
+            1, int(time.time() - (self._thinking_started_at or time.time())),
+        )
+        try:
+            await self.bot.edit_message_text(
+                chat_id=self.chat_id,
+                message_id=self._thinking_msg_id,
+                text=f"💭 thought for {elapsed}s",
+            )
+        except BadRequest:
+            pass
+        except Exception:
+            log.debug("thinking finalise failed", exc_info=True)
+        self._thinking_msg_id = None
+        self._thinking_started_at = None
+        self._last_thinking_text = ""
+
+    async def close(self) -> None:
+        # Cancel the heartbeat first so it doesn't race with end_thinking.
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._heartbeat_task = None
+        await self.end_thinking()
+
+
 # ---- driving a turn -------------------------------------------------------
 
 async def run_query(chat: ChatState, session: BridgeSession, prompt: str,
@@ -347,19 +482,26 @@ async def run_query(chat: ChatState, session: BridgeSession, prompt: str,
         )
         return
 
+    indicator = TurnIndicator(bot, chat.chat_id)
+    await indicator.start()
+
     try:
-        await bot.send_chat_action(chat_id=chat.chat_id, action=ChatAction.TYPING)
         async for ev in backend.query(prompt):
-            if isinstance(ev, TextEvent):
+            if isinstance(ev, ThinkingEvent):
+                await indicator.thinking()
+            elif isinstance(ev, TextEvent):
+                await indicator.end_thinking()
                 if ev.text.strip():
                     await send_chunked(bot, chat.chat_id, ev.text)
             elif isinstance(ev, ToolUseEvent):
+                await indicator.end_thinking()
                 await bot.send_message(
                     chat_id=chat.chat_id,
                     text=render_tool_call(ev.name, ev.input),
                     parse_mode=ParseMode.HTML,
                 )
             elif isinstance(ev, ResultEvent):
+                await indicator.end_thinking()
                 if ev.error:
                     suffix = f"\n{ev.message}" if ev.message else ""
                     await bot.send_message(
@@ -372,6 +514,8 @@ async def run_query(chat: ChatState, session: BridgeSession, prompt: str,
     except Exception as e:
         log.exception("run_query failed")
         await bot.send_message(chat_id=chat.chat_id, text=f"❌ Error: {e}")
+    finally:
+        await indicator.close()
 
 
 # ---- message queue / worker -----------------------------------------------

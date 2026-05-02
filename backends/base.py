@@ -46,6 +46,16 @@ class ToolUseEvent:
 
 
 @dataclass
+class ThinkingEvent:
+    """The model is reasoning (extended-thinking on Claude, reasoning parts
+    on opencode). Backends should emit this as a heartbeat so the bridge
+    can show a live indicator; the actual reasoning text is rarely useful
+    to display so we treat ``text`` as optional and the bridge currently
+    ignores it."""
+    text: str = ""
+
+
+@dataclass
 class ResultEvent:
     """Turn finished. ``error`` indicates the agent itself failed (vs. the
     user got a normal answer). ``message`` is an optional human-readable
@@ -54,7 +64,7 @@ class ResultEvent:
     message: Optional[str] = None
 
 
-BackendEvent = Union[TextEvent, ToolUseEvent, ResultEvent]
+BackendEvent = Union[TextEvent, ToolUseEvent, ThinkingEvent, ResultEvent]
 
 
 # ---- Permission callback ---------------------------------------------------

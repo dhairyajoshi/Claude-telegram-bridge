@@ -13,6 +13,7 @@ from .base import (
     PermissionAsker,
     ResultEvent,
     TextEvent,
+    ThinkingEvent,
     ToolUseEvent,
 )
 
@@ -23,6 +24,7 @@ __all__ = [
     "PermissionAsker",
     "ResultEvent",
     "TextEvent",
+    "ThinkingEvent",
     "ToolUseEvent",
     "load_backend",
 ]

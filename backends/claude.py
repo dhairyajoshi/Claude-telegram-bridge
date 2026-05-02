@@ -34,6 +34,7 @@ from .base import (
     PermissionAsker,
     ResultEvent,
     TextEvent,
+    ThinkingEvent,
     ToolUseEvent,
 )
 
@@ -104,7 +105,10 @@ class ClaudeBackendSession:
                         elif isinstance(block, ToolUseBlock):
                             yield ToolUseEvent(name=block.name, input=block.input)
                         elif isinstance(block, ThinkingBlock):
-                            pass
+                            # Surface as a heartbeat; the bridge renders a
+                            # transient "thinking" indicator and discards
+                            # the raw reasoning text.
+                            yield ThinkingEvent()
                 elif isinstance(message, ResultMessage):
                     error = message.is_error or message.subtype != "success"
                     msg = message.result or message.subtype if error else None
