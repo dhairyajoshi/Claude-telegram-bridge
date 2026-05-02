@@ -28,6 +28,14 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
+# SystemMessage / StreamEvent are recent SDK additions and we only use
+# them for opportunistic session_id capture. Tolerate older SDKs where
+# they may not be exported.
+try:  # pragma: no cover - depends on SDK version
+    from claude_agent_sdk import SystemMessage  # type: ignore
+except ImportError:  # pragma: no cover
+    SystemMessage = None  # type: ignore
+
 from .base import (
     Backend,
     BackendSession,
@@ -56,6 +64,11 @@ class ClaudeBackendSession:
     cwd: str
     model: str
     _ask_permission: PermissionAsker
+    # Claude session UUID. Populated by the bridge from a previous run
+    # (so we can pass ``resume=`` to the SDK) and refreshed every turn
+    # from message metadata so it always reflects the live transcript
+    # the SDK is appending to on disk.
+    resume_id: Optional[str] = None
     client: Optional[ClaudeSDKClient] = field(default=None)
 
     async def _ensure_client(self) -> ClaudeSDKClient:
@@ -75,14 +88,37 @@ class ClaudeBackendSession:
                 else PermissionResultDeny(message="user denied")
             )
 
-        options = ClaudeAgentOptions(
+        opts: dict = dict(
             model=self.model,
             cwd=self.cwd,
             permission_mode="default",
             can_use_tool=can_use_tool,
         )
-        client = ClaudeSDKClient(options=options)
-        await client.connect()
+        # ``resume`` re-hydrates the session transcript from
+        # ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl. If the file is
+        # gone (user nuked it, cwd changed, etc.) the SDK errors out;
+        # we'd rather start a new session than refuse to talk, so try
+        # with resume first and fall back on any failure.
+        attempted_resume = self.resume_id
+        if attempted_resume:
+            opts["resume"] = attempted_resume
+
+        try:
+            client = ClaudeSDKClient(options=ClaudeAgentOptions(**opts))
+            await client.connect()
+        except Exception as e:
+            if attempted_resume:
+                log.warning(
+                    "resume of session %s failed (%s); starting fresh",
+                    attempted_resume, e,
+                )
+                self.resume_id = None
+                opts.pop("resume", None)
+                client = ClaudeSDKClient(options=ClaudeAgentOptions(**opts))
+                await client.connect()
+            else:
+                raise
+
         self.client = client
         return client
 
@@ -97,6 +133,12 @@ class ClaudeBackendSession:
         try:
             await client.query(prompt)
             async for message in client.receive_response():
+                # Opportunistically capture the SDK's session id from any
+                # message that carries one. The bridge persists this so
+                # the next run can ``resume=`` into the same transcript.
+                sid = getattr(message, "session_id", None)
+                if sid:
+                    self.resume_id = sid
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
                         if isinstance(block, TextBlock):
@@ -144,7 +186,9 @@ class ClaudeBackend:
 
     async def open_session(
         self, *, cwd: str, model: str, ask_permission: PermissionAsker,
+        resume_id: Optional[str] = None,
     ) -> BackendSession:
         return ClaudeBackendSession(
             cwd=cwd, model=model, _ask_permission=ask_permission,
+            resume_id=resume_id,
         )

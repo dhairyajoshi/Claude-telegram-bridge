@@ -73,11 +73,24 @@ class OpencodeBackendSession:
     _http: httpx.AsyncClient
     _agent: Optional[str] = None
     session_id: Optional[str] = None
+    # ``resume_id`` and ``session_id`` are the same opencode session
+    # identifier. We keep two names so the bridge can read a generic
+    # ``resume_id`` attribute (matching the BackendSession protocol),
+    # while internal opencode code keeps using ``session_id`` for
+    # readability around HTTP paths.
     # part IDs we've already emitted an event for this turn (tool calls,
     # reasoning bursts) so we don't spam the chat as parts transition
     # through pending/running/completed snapshots.
     _emitted_part_ids: set = field(default_factory=set)
     _pending_perm_tasks: set = field(default_factory=set)
+
+    @property
+    def resume_id(self) -> Optional[str]:
+        return self.session_id
+
+    @resume_id.setter
+    def resume_id(self, value: Optional[str]) -> None:
+        self.session_id = value
 
     async def _ensure_session(self) -> str:
         if self.session_id is not None:
@@ -312,6 +325,7 @@ class OpencodeBackend:
 
     async def open_session(
         self, *, cwd: str, model: str, ask_permission: PermissionAsker,
+        resume_id: Optional[str] = None,
     ) -> BackendSession:
         auth = (
             httpx.BasicAuth(self.username, self.password)
@@ -323,10 +337,16 @@ class OpencodeBackend:
             auth=auth,
             timeout=httpx.Timeout(connect=10, read=None, write=30, pool=10),
         )
+        # opencode has no separate ``resume`` semantics — adopting the
+        # prior session id and posting a message to it is the resume.
+        # If the server has been restarted in the meantime the session
+        # is gone and the next ``POST /session/{id}/message`` will 404;
+        # callers should treat that as a fresh start.
         return OpencodeBackendSession(
             cwd=cwd,
             model=model,
             _ask_permission=ask_permission,
             _http=client,
             _agent=self.default_agent,
+            session_id=resume_id,
         )
