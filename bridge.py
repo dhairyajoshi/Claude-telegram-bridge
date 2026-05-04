@@ -1,11 +1,13 @@
 """
 Coding-agent <-> Telegram bridge.
 
-Lets you drive an AI coding agent (Claude Code or opencode) on this Mac
+Lets you drive an AI coding agent (Claude Code, opencode, or Codex) on this Mac
 from a Telegram chat. Each chat can hold multiple sessions (short numeric
 IDs) and you switch between them with /switch. Read-only tools auto-allow
 (Claude backend) or use opencode's own permission config; everything else
-prompts with Allow/Deny buttons.
+prompts with Allow/Deny buttons. The Codex backend uses the official
+Codex SDK sidecar, so command safety is controlled by Codex sandbox and
+approval settings.
 
 Setup
 -----
@@ -14,15 +16,19 @@ Setup
 3. Export env vars:
        export TELEGRAM_BOT_TOKEN=...
        export ALLOWED_USER_IDS=12345              # comma-separated
-       export CLAUDE_BRIDGE_CWD=$HOME/some/repo   # optional, default $HOME
+       export AGENT_BRIDGE_CWD=$HOME/some/repo    # optional, default $HOME
 
    Backend selection (default: claude):
-       export BRIDGE_BACKEND=claude               # or "opencode"
+       export BRIDGE_BACKEND=claude               # or "opencode" / "codex"
        export CLAUDE_BRIDGE_MODEL=claude-opus-4-7 # claude backend default
        # opencode backend (run `opencode serve` separately):
        export OPENCODE_BASE_URL=http://127.0.0.1:4096
        export OPENCODE_SERVER_PASSWORD=...        # if you set one
        export OPENCODE_BRIDGE_MODEL=anthropic/claude-sonnet-4-5  # provider/model
+       # codex backend:
+       export CODEX_BRIDGE_MODEL=gpt-5.5          # optional; empty uses Codex config default
+       export CODEX_BRIDGE_SANDBOX=workspace-write
+       export CODEX_BRIDGE_APPROVAL_POLICY=never
 
 4. uv run python bridge.py
 
@@ -30,7 +36,7 @@ Commands in chat:
     /start                show active session
     /sessions             list sessions in this chat
     /switch <id>          switch active session
-    /new [backend]        create a new session (backend: claude|opencode)
+    /new [backend]        create a new session (backend: claude|opencode|codex)
     /rm <id>              remove a session
     /stop                 interrupt the running task
     /cd <path>            change cwd of the active session
@@ -90,10 +96,14 @@ ALLOWED_USER_IDS = {
     for x in os.environ.get("ALLOWED_USER_IDS", "").split(",")
     if x.strip()
 }
-DEFAULT_CWD = os.environ.get("CLAUDE_BRIDGE_CWD") or os.path.expanduser("~")
+DEFAULT_CWD = (
+    os.environ.get("AGENT_BRIDGE_CWD")
+    or os.environ.get("CLAUDE_BRIDGE_CWD")
+    or os.path.expanduser("~")
+)
 DEFAULT_BACKEND = os.environ.get("BRIDGE_BACKEND", "claude")
 
-KNOWN_BACKENDS = ("claude", "opencode")
+KNOWN_BACKENDS = ("claude", "opencode", "codex")
 
 # Resolved Backend instances, lazily populated. We keep them per-process
 # (they're just factories) so two chats can share one OpencodeBackend.
@@ -872,7 +882,11 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             return
         backend_name = cand
     try:
-        s = c.new_session(backend_name=backend_name)
+        active = c.active()
+        s = c.new_session(
+            backend_name=backend_name,
+            cwd=active.cwd if active else None,
+        )
     except Exception as e:
         log.exception("new_session failed")
         await update.message.reply_text(f"❌ Could not create session: {e}")
@@ -1216,7 +1230,7 @@ def main() -> None:
     if not ALLOWED_USER_IDS:
         raise SystemExit("Set ALLOWED_USER_IDS (comma-separated Telegram user ids)")
     if not os.path.isdir(DEFAULT_CWD):
-        raise SystemExit(f"CLAUDE_BRIDGE_CWD does not exist: {DEFAULT_CWD}")
+        raise SystemExit(f"AGENT_BRIDGE_CWD does not exist: {DEFAULT_CWD}")
     if DEFAULT_BACKEND not in KNOWN_BACKENDS:
         raise SystemExit(
             f"BRIDGE_BACKEND={DEFAULT_BACKEND!r} not in {KNOWN_BACKENDS}"

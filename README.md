@@ -1,17 +1,21 @@
-# claude-telegram-bridge
+# agent-telegram-bridge
 
-Drive an AI coding agent on your machine from a Telegram chat. Supports
-two backends:
+Drive local AI coding agents on your machine from a Telegram chat. Supports
+multiple backends:
 
 - **claude** — [Claude Code](https://docs.claude.com/en/docs/claude-code)
   via `claude-agent-sdk` (the default).
 - **opencode** — [opencode](https://opencode.ai) via its local HTTP
   server (`opencode serve`). Experimental.
+- **codex** — Codex via the official `@openai/codex-sdk` package. Experimental.
 
 Each chat can hold multiple sessions, each with its own backend, working
 directory, and conversation history. Read-only tools auto-allow (claude
 backend) or follow opencode's permission config; anything else (`Bash`,
 `Write`, `Edit`, ...) sends an inline **Allow / Deny** prompt to your chat.
+The Codex backend runs through the SDK's local Codex agent stream, so
+command safety is controlled by Codex sandbox/approval settings rather
+than Telegram approval buttons.
 
 While the agent is working you'll see a live "typing…" indicator in the
 chat header and a transient **💭 thinking…** message that ticks elapsed
@@ -19,8 +23,8 @@ time and finalises to **💭 thought for Ns** — so idle gaps (slow bash,
 model warm-up, extended reasoning) don't make the chat feel stuck.
 
 Sessions persist across restarts. The bridge keeps a snapshot of every
-chat's sessions at `~/.claude-telegram-bridge/state.json` and reconnects
-to the underlying agent (Claude SDK / opencode) with the original
+chat's sessions at `~/.agent-telegram-bridge/state.json` and reconnects
+to the underlying agent (Claude SDK / opencode / Codex) with the original
 session id on the next message — your conversation history survives a
 reboot. You can also `/resume` an existing Claude CLI transcript from
 `~/.claude/projects` and continue it through the bot.
@@ -35,8 +39,8 @@ to it.
 
 1. Open Telegram and message [@BotFather](https://t.me/BotFather).
 2. Send `/newbot`.
-3. Pick a **display name** (anything, e.g. `My Claude Bridge`).
-4. Pick a **username** ending in `bot` (e.g. `myclaudebridge_bot`). Must be
+3. Pick a **display name** (anything, e.g. `Agent Bridge`).
+4. Pick a **username** ending in `bot` (e.g. `my_agent_bridge_bot`). Must be
    globally unique.
 5. BotFather replies with an **HTTP API token** that looks like:
 
@@ -78,11 +82,14 @@ The bridge only responds to whitelisted numeric user IDs.
 ## 3. Clone and install
 
 ```bash
-git clone <this-repo-url> claude-telegram-bridge
-cd claude-telegram-bridge
+git clone <this-repo-url> agent-telegram-bridge
+cd agent-telegram-bridge
 
 # uv handles the venv + Python 3.12+ automatically
 uv sync
+
+# needed for the Codex backend's official SDK sidecar
+npm install
 ```
 
 If you don't have `uv`, install it from
@@ -93,6 +100,7 @@ If you don't have `uv`, install it from
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install "claude-agent-sdk>=0.1.72" "python-telegram-bot>=21.0" "httpx>=0.27" "httpx-sse>=0.4"
+npm install
 ```
 
 ### Backend prerequisites
@@ -116,6 +124,13 @@ Leave that running in another terminal. The bridge will pick up the same
 `OPENCODE_SERVER_PASSWORD` from its env. If you skip the password the
 server is unauthenticated — fine for `127.0.0.1` only, never expose it.
 
+For the **codex** backend you need Node.js 18+, the project npm dependency
+installed, and the **Codex CLI** authenticated on the same machine. Quick
+sanity checks: `node --version` and `codex --version`. The bridge uses the
+official `@openai/codex-sdk` TypeScript package through a small Node sidecar,
+stores the Codex thread id, and resumes later messages with the SDK's
+`resumeThread()`.
+
 ## 4. Configure environment variables
 
 Required:
@@ -129,9 +144,9 @@ Optional (general):
 
 | Variable                    | Default                                  | What it is                                                          |
 | --------------------------- | ---------------------------------------- | ------------------------------------------------------------------- |
-| `CLAUDE_BRIDGE_CWD`         | `$HOME`                                  | Default working directory for new sessions                          |
-| `BRIDGE_BACKEND`            | `claude`                                 | Default backend: `claude` or `opencode`                             |
-| `CLAUDE_BRIDGE_STATE_FILE`  | `~/.claude-telegram-bridge/state.json`   | Where the bridge persists its session snapshot for restart recovery |
+| `AGENT_BRIDGE_CWD`          | `$HOME`                                  | Initial working directory for the first session                      |
+| `BRIDGE_BACKEND`            | `claude`                                 | Default backend: `claude`, `opencode`, or `codex`                   |
+| `AGENT_BRIDGE_STATE_FILE`   | `~/.agent-telegram-bridge/state.json`    | Where the bridge persists its session snapshot for restart recovery |
 
 Optional (claude backend):
 
@@ -149,18 +164,32 @@ Optional (opencode backend):
 | `OPENCODE_BRIDGE_MODEL`     | _(unset)_                | Model in `<provider>/<id>` form, e.g. `anthropic/claude-sonnet-4-5`       |
 | `OPENCODE_BRIDGE_AGENT`     | _(unset)_                | Default opencode agent (e.g. `build`)                                     |
 
+Optional (codex backend):
+
+| Variable               | Default           | What it is                                           |
+| ---------------------- | ----------------- | ---------------------------------------------------- |
+| `CODEX_BRIDGE_MODEL`   | _(unset)_         | Codex model to use; empty uses your Codex config     |
+| `CODEX_BRIDGE_SANDBOX` | `workspace-write` | Codex sandbox: `read-only`, `workspace-write`, or `danger-full-access` |
+| `CODEX_BRIDGE_APPROVAL_POLICY` | `never` | Codex approval policy passed to the SDK              |
+| `CODEX_BRIDGE_TRANSPORT` | `sdk`           | Use `sdk`; set `exec` only to fall back to direct `codex exec --json` |
+
 Export them in your shell:
 
 ```bash
 export TELEGRAM_BOT_TOKEN="123456789:ABCdef..."
 export ALLOWED_USER_IDS="12345678"
-export CLAUDE_BRIDGE_CWD="$HOME/workspace/some-repo"
+export AGENT_BRIDGE_CWD="$HOME/workspace/some-repo"
 export CLAUDE_BRIDGE_MODEL="claude-opus-4-7"
 
 # only if you want opencode:
 export BRIDGE_BACKEND="opencode"
 export OPENCODE_SERVER_PASSWORD="..."
 export OPENCODE_BRIDGE_MODEL="anthropic/claude-sonnet-4-5"
+
+# only if you want codex:
+export BRIDGE_BACKEND="codex"
+export CODEX_BRIDGE_MODEL="gpt-5.5"
+export CODEX_BRIDGE_SANDBOX="workspace-write"
 ```
 
 Or drop them in a `.env` file and `source` it before running. Keep that
@@ -183,8 +212,8 @@ bridge starting (cwd=..., model=..., allowed=[12345678])
 1. Open the bot's chat in Telegram (search by the username you picked, or
    click the `t.me/<username>` link BotFather gave you).
 2. Press **Start** or send `/start`.
-3. Send any message — the bridge runs it as a Claude Code prompt in
-   `CLAUDE_BRIDGE_CWD`.
+3. Send any message — the bridge sends it to the active backend in
+   `AGENT_BRIDGE_CWD`.
 
 ### Commands
 
@@ -193,7 +222,7 @@ bridge starting (cwd=..., model=..., allowed=[12345678])
 | `/start`        | Show active session (cwd / model / id)                                  |
 | `/sessions`     | List all sessions in this chat (alias: `/ls`). Active is marked `▶`     |
 | `/switch <id>`  | Switch the active session to the given short id (e.g. `/switch 2`)      |
-| `/new [backend]`| Create a new session and make it active. Backend is `claude` or `opencode`; defaults to `BRIDGE_BACKEND`. Old sessions stick around |
+| `/new [backend]`| Create a new session and make it active. Backend is `claude`, `opencode`, or `codex`; defaults to `BRIDGE_BACKEND`. New sessions inherit the active session's cwd |
 | `/rm <id>`      | Remove a session and disconnect its client                              |
 | `/stop`         | Interrupt the running task                                              |
 | `/cd <path>`    | Change cwd of the active session (takes effect on next message)         |
@@ -213,8 +242,8 @@ Bot:  Sessions
       ▶ #1  claude    /Users/me/repo-a   claude-opus-4-7  [open]
         #2  opencode  /Users/me/repo-b   anthropic/claude-sonnet-4-5
 
-You:  /new opencode
-Bot:  🆕 New session #3 (backend=opencode, active).
+You:  /new codex
+Bot:  🆕 New session #3 (backend=codex, active).
 
 You:  /switch 1
 Bot:  Switched to session #1 (claude).
@@ -226,8 +255,8 @@ something is in flight.
 ### Persistence and `/resume`
 
 The bridge writes a snapshot of every chat's sessions to
-`~/.claude-telegram-bridge/state.json` (override with
-`CLAUDE_BRIDGE_STATE_FILE`) after every meaningful change — new session,
+`~/.agent-telegram-bridge/state.json` (override with
+`AGENT_BRIDGE_STATE_FILE`) after every meaningful change — new session,
 cwd update, end-of-turn, etc. On startup it rebuilds `CHATS` and lazily
 reconnects to the underlying agent client with the original session id
 the next time you send a message. Live state (running tasks, queued
@@ -262,10 +291,10 @@ While a turn is running the bridge keeps Telegram's "typing…" indicator
 refreshed every ~4s, so the chat header always shows the bot is busy.
 The first time the agent enters a thinking burst it sends a transient
 **💭 thinking…** message which ticks elapsed time; once thinking ends
-it's replaced with **💭 thought for Ns**. Both Claude (`ThinkingBlock`)
-and opencode (reasoning parts) are handled. The indicator is torn down
-in a `finally`, so `/stop` and backend crashes won't leave a stuck
-heartbeat.
+it's replaced with **💭 thought for Ns**. Claude (`ThinkingBlock`),
+opencode (reasoning parts), and Codex SDK turn-start / reasoning events
+are handled. The indicator is torn down in a `finally`, so `/stop` and
+backend crashes won't leave a stuck heartbeat.
 
 ### Tool permissions
 
@@ -293,7 +322,14 @@ prompt. Example:
 }
 ```
 
-Approval times out after 10 minutes on either backend and defaults to deny.
+**codex backend.** The bridge drives Codex through the official
+`@openai/codex-sdk` package. The SDK exposes streamed tool/file/message
+events, but not a Claude-style permission callback for Telegram. Use
+`CODEX_BRIDGE_SANDBOX` and `CODEX_BRIDGE_APPROVAL_POLICY` to control what
+Codex may do locally. Set `CODEX_BRIDGE_TRANSPORT=exec` only if you need
+to fall back to the direct `codex exec --json` implementation.
+
+Approval prompts time out after 10 minutes and default to deny.
 
 ## 7. Keep it running (optional)
 
@@ -326,8 +362,8 @@ The bridge is a foreground Python process. A few options to keep it up:
   cwd matches the directory you used `claude` in. The error message
   prints the exact path it checked.
 - **Restart didn't restore my sessions** — check that the bridge can
-  write to `~/.claude-telegram-bridge/`. Look for a "could not write
-  state file" warning in the logs. Set `CLAUDE_BRIDGE_STATE_FILE` to
+  write to `~/.agent-telegram-bridge/`. Look for a "could not write
+  state file" warning in the logs. Set `AGENT_BRIDGE_STATE_FILE` to
   point somewhere writable if the default isn't.
 - **Stuck "typing…" or "💭 thinking…" message** — should clear on the
   next turn boundary; if it doesn't, `/stop` and try again. The
