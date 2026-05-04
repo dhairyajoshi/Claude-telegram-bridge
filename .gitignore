@@ -9,5 +9,7 @@ wheels/
 # Virtual environments
 .venv
 
-curl -m 10 -s -o /dev/null -w 'http=%{http_code} time=%{time_total}\n' https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getMe
+# Node dependencies for the Codex SDK sidecar
+node_modules/
 
+curl -m 10 -s -o /dev/null -w 'http=%{http_code} time=%{time_total}\n' https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getMe

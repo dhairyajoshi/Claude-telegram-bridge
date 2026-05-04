@@ -1,7 +1,7 @@
 """Backend implementations for the Telegram bridge.
 
 A backend is something that can drive an AI coding agent on this machine
-(Claude Code, opencode, ...). The bridge talks to backends through the
+(Claude Code, opencode, Codex, ...). The bridge talks to backends through the
 ``Backend`` / ``BackendSession`` protocols defined in :mod:`backends.base`.
 """
 from __future__ import annotations
@@ -39,4 +39,9 @@ def load_backend(name: str) -> Backend:
     if name == "opencode":
         from .opencode import OpencodeBackend
         return OpencodeBackend.from_env()
-    raise ValueError(f"unknown backend: {name!r} (expected: claude, opencode)")
+    if name == "codex":
+        from .codex import CodexBackend
+        return CodexBackend.from_env()
+    raise ValueError(
+        f"unknown backend: {name!r} (expected: claude, opencode, codex)"
+    )

@@ -1,7 +1,7 @@
 [project]
-name = "claude-telegram-bridge"
+name = "agent-telegram-bridge"
 version = "0.1.0"
-description = "Add your description here"
+description = "Drive local AI coding agents from Telegram"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

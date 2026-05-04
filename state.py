@@ -9,7 +9,7 @@ restart:
 
 - per-chat: active session id and a counter for the next short id
 - per-session: short id, backend name, cwd, model, and the agent-level
-  resume token (Claude session UUID, opencode session id, ...)
+  resume token (Claude session UUID, opencode session id, Codex thread id, ...)
 
 We deliberately don't persist live backend client objects, queue
 contents, or pending approvals — those are tied to the running process.
@@ -17,8 +17,10 @@ On restart, the bridge rebuilds ``BridgeSession`` records and lazily
 re-opens the underlying agent client (with ``resume_id`` if present)
 the first time a message arrives in that session.
 
-The state file lives at ``~/.claude-telegram-bridge/state.json`` by
-default; override with ``CLAUDE_BRIDGE_STATE_FILE``.
+The state file lives at ``~/.agent-telegram-bridge/state.json`` by
+default; override with ``AGENT_BRIDGE_STATE_FILE``. The older
+``CLAUDE_BRIDGE_STATE_FILE`` name is still accepted as a compatibility
+fallback.
 """
 from __future__ import annotations
 
@@ -33,10 +35,13 @@ log = logging.getLogger("bridge.state")
 
 VERSION = 1
 
-DEFAULT_STATE_DIR = os.path.expanduser("~/.claude-telegram-bridge")
+DEFAULT_STATE_DIR = os.path.expanduser("~/.agent-telegram-bridge")
 STATE_FILE = os.environ.get(
-    "CLAUDE_BRIDGE_STATE_FILE",
-    os.path.join(DEFAULT_STATE_DIR, "state.json"),
+    "AGENT_BRIDGE_STATE_FILE",
+    os.environ.get(
+        "CLAUDE_BRIDGE_STATE_FILE",
+        os.path.join(DEFAULT_STATE_DIR, "state.json"),
+    ),
 )
 
 

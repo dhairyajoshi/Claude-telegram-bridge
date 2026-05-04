@@ -1,0 +1,8 @@
+{
+  "name": "agent-telegram-bridge",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@openai/codex-sdk": "^0.128.0"
+  }
+}
